@@ -1,257 +1,243 @@
 import os
 import json
-import datetime
 import base64
+from datetime import datetime, timedelta
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# =========================
-# CONFIG
-# =========================
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+# ======================
+# ENV VARIABLES
+# ======================
 
-# decode service account JSON
-SERVICE_JSON = json.loads(base64.b64decode(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]))
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
+SERVICE_JSON = json.loads(
+    base64.b64decode(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+)
+
+SPREADSHEET_ID = "YOUR_SHEET_ID"
+
+CUSTOMERS_SHEET = "Customers"
+PURCHASES_SHEET = "2026 Purchases"
+
+# ======================
+# GOOGLE SETUP
+# ======================
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 creds = Credentials.from_service_account_info(SERVICE_JSON, scopes=SCOPES)
 service = build("sheets", "v4", credentials=creds)
 
-CUSTOMERS_SHEET = "Customers"
-PURCHASES_SHEET = "2026 Purchases"
-
-# =========================
+# ======================
 # HELPERS
-# =========================
+# ======================
 
-def normalize_instagram(value: str) -> str:
+def now_iso():
+    return datetime.utcnow().isoformat()
+
+def normalize_handle(value):
     return value.strip().lower().lstrip("@")
 
-def now():
-    return datetime.datetime.utcnow().isoformat()
-
-def get_sheet(sheet):
+def get_rows(sheet_name):
     result = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=f"{sheet}!A:Z"
-    ).execute()
-    values = result.get("values", [])
-    headers = values[0]
-    rows = values[1:]
-    return headers, rows
-
-def append_row(sheet, row):
-    service.spreadsheets().values().append(
-        spreadsheetId=SHEET_ID,
-        range=f"{sheet}!A:Z",
-        valueInputOption="RAW",
-        body={"values": [row]}
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A:Z"
     ).execute()
 
-def update_cell(sheet, row_index, col_index, value):
+    rows = result.get("values", [])
+    headers = rows[0]
+    data = rows[1:]
+    return headers, data
+
+def find_customer(telegram_id):
+    headers, rows = get_rows(CUSTOMERS_SHEET)
+
+    for i, row in enumerate(rows):
+        row_dict = dict(zip(headers, row))
+        if str(row_dict.get("telegram_user_id")) == str(telegram_id):
+            return i + 2, row_dict  # row index in sheet
+
+    return None, None
+
+def update_cell(row, col_name, value):
+    headers, _ = get_rows(CUSTOMERS_SHEET)
+    col_index = headers.index(col_name)
+
+    col_letter = chr(ord('A') + col_index)
+
     service.spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=f"{sheet}!{chr(65+col_index)}{row_index+2}",
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{CUSTOMERS_SHEET}!{col_letter}{row}",
         valueInputOption="RAW",
         body={"values": [[value]]}
     ).execute()
 
-# =========================
-# CUSTOMER FUNCTIONS
-# =========================
+def append_customer(telegram_id, username):
+    headers, _ = get_rows(CUSTOMERS_SHEET)
 
-def find_customer(telegram_id):
-    headers, rows = get_sheet(CUSTOMERS_SHEET)
-    for i, row in enumerate(rows):
-        if len(row) > 0 and row[0] == str(telegram_id):
-            return headers, row, i
-    return headers, None, None
+    row = [""] * len(headers)
 
-def create_customer(user):
-    append_row(CUSTOMERS_SHEET, [
-        user.id,
-        user.username or "",
-        "",
-        "",
-        0,
-        "Bean",
-        0,
-        now(),
-        now(),
-        "",
-        ""
-    ])
+    row[headers.index("telegram_user_id")] = str(telegram_id)
+    row[headers.index("telegram_username")] = username
+    row[headers.index("created_at")] = now_iso()
 
-# =========================
-# POINTS LOGIC
-# =========================
-
-def get_tier(points):
-    if points >= 10000:
-        return "Glassy"
-    elif points >= 3000:
-        return "Icy"
-    elif points >= 1500:
-        return "Water"
-    return "Bean"
-
-def get_multiplier(tier):
-    return {
-        "Bean": 1,
-        "Water": 1.5,
-        "Icy": 2,
-        "Glassy": 3
-    }[tier]
+    service.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=CUSTOMERS_SHEET,
+        valueInputOption="RAW",
+        body={"values": [row]}
+    ).execute()
 
 def calculate_points(instagram):
-    headers, rows = get_sheet(PURCHASES_SHEET)
+    headers, rows = get_rows(PURCHASES_SHEET)
 
-    total_points = 0
-    last6m_points = 0
+    total = 0
+    last_6m = 0
 
-    six_months_ago = datetime.datetime.utcnow() - datetime.timedelta(days=180)
+    now = datetime.utcnow()
 
     for row in rows:
-        if len(row) < 21:
+        row_dict = dict(zip(headers, row))
+
+        if normalize_handle(row_dict.get("instagram_handle", "")) != instagram:
             continue
 
-        handle = normalize_instagram(row[7])
-        points_awarded = row[19] if len(row) > 19 else ""
-        timestamp = row[20] if len(row) > 20 else ""
-
-        if handle != instagram:
-            continue
-
-        if points_awarded != "yes":
+        if row_dict.get("points_awarded") != "yes":
             continue
 
         try:
-            dt = datetime.datetime.fromisoformat(timestamp)
+            points = int(float(row_dict.get("NGI", 0)))
         except:
-            continue
+            points = 0
 
-        amount = float(row[14])
+        total += points
 
-        # base points = amount
-        base_points = int(amount)
+        ts = row_dict.get("points_awarded_at")
+        if ts:
+            dt = datetime.fromisoformat(ts.replace("Z", ""))
+            if now - dt <= timedelta(days=180):
+                last_6m += points
 
-        total_points += base_points
+    return total, last_6m
 
-        if dt >= six_months_ago:
-            last6m_points += base_points
+def determine_tier(points_6m):
+    if points_6m >= 10000:
+        return "Glassy"
+    elif points_6m >= 3000:
+        return "Icy"
+    elif points_6m >= 1500:
+        return "Water"
+    else:
+        return "Bean"
 
-    return total_points, last6m_points
-
-def build_progress_bar(current, target):
-    filled = int((current / target) * 10)
-    return "🟩" * filled + "⬜" * (10 - filled)
-
-# =========================
-# BOT HANDLERS
-# =========================
+# ======================
+# BOT FLOW
+# ======================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    headers, customer, idx = find_customer(user.id)
+
+    row, customer = find_customer(user.id)
 
     if not customer:
-        create_customer(user)
+        append_customer(user.id, user.username)
         await update.message.reply_text(
-            "Welcome to WLJ Rewards!\n\nPlease enter your Instagram handle (without @):"
+            "Welcome! Please enter your Instagram handle (without @)."
         )
-        context.user_data["awaiting_handle"] = True
+        context.user_data["state"] = "WAIT_HANDLE"
         return
 
-    # check missing fields
-    if not customer[2]:
-        await update.message.reply_text("Please enter your Instagram handle (without @):")
-        context.user_data["awaiting_handle"] = True
+    if not customer.get("instagram_handle"):
+        await update.message.reply_text("Please enter your Instagram handle.")
+        context.user_data["state"] = "WAIT_HANDLE"
         return
 
-    if not customer[3]:
-        await update.message.reply_text("Please enter your birthday (DD-MM-YYYY):")
-        context.user_data["awaiting_birthday"] = True
+    if not customer.get("birthday"):
+        await update.message.reply_text("Please enter your birthday (DD-MM-YYYY).")
+        context.user_data["state"] = "WAIT_BDAY"
         return
 
-    await update.message.reply_text("You're back at the main menu.")
+    await show_menu(update)
+
+async def show_menu(update):
+    await update.message.reply_text(
+        "Main Menu:\n- Check Points\n- Change Handle"
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
     user = update.effective_user
-    text = update.message.text.strip()
 
-    headers, customer, idx = find_customer(user.id)
+    row, customer = find_customer(user.id)
 
-    if context.user_data.get("awaiting_handle"):
-        handle = normalize_instagram(text)
-        update_cell(CUSTOMERS_SHEET, idx, 2, handle)
+    state = context.user_data.get("state")
 
-        context.user_data["awaiting_handle"] = False
-        context.user_data["awaiting_birthday"] = True
+    # ================= HANDLE =================
+    if state == "WAIT_HANDLE":
+        handle = normalize_handle(text)
+        update_cell(row, "instagram_handle", handle)
+        context.user_data["state"] = None
 
-        await update.message.reply_text("Please enter your birthday (DD-MM-YYYY):")
+        await update.message.reply_text(f"Saved as @{handle}")
+
+        if not customer.get("birthday"):
+            await update.message.reply_text("Enter birthday (DD-MM-YYYY)")
+            context.user_data["state"] = "WAIT_BDAY"
+            return
+
+        await show_menu(update)
         return
 
-    if context.user_data.get("awaiting_birthday"):
-        update_cell(CUSTOMERS_SHEET, idx, 3, text)
+    # ================= BDAY =================
+    if state == "WAIT_BDAY":
+        update_cell(row, "birthday", text)
+        context.user_data["state"] = None
 
-        context.user_data["awaiting_birthday"] = False
-
-        await update.message.reply_text("Registration complete 🎉")
+        await update.message.reply_text("Birthday saved 🎂")
+        await show_menu(update)
         return
 
-    # =========================
-    # CHECK POINTS
-    # =========================
-    if text.lower() in ["check points", "/checkpoints"]:
-        instagram = normalize_instagram(customer[2])
+    # ================= CHECK POINTS =================
+    if text.lower() == "check points":
+        if not customer.get("instagram_handle"):
+            context.user_data["state"] = "WAIT_HANDLE"
+            await update.message.reply_text("Enter your Instagram handle.")
+            return
 
-        total, last6m = calculate_points(instagram)
+        if not customer.get("birthday"):
+            context.user_data["state"] = "WAIT_BDAY"
+            await update.message.reply_text("Enter your birthday.")
+            return
 
-        tier = get_tier(last6m)
+        instagram = normalize_handle(customer["instagram_handle"])
 
-        update_cell(CUSTOMERS_SHEET, idx, 4, total)
-        update_cell(CUSTOMERS_SHEET, idx, 5, tier)
-        update_cell(CUSTOMERS_SHEET, idx, 6, last6m)
-
-        target = {
-            "Bean": 1500,
-            "Water": 3000,
-            "Icy": 10000,
-            "Glassy": 10000
-        }[tier]
-
-        progress = build_progress_bar(last6m, target)
+        total, last6 = calculate_points(instagram)
+        tier = determine_tier(last6)
 
         await update.message.reply_text(
-            f"""Instagram: @{instagram}
-Current usable points: {total}
-Tier: {tier}
-Points (last 6 months): {last6m}
-
-Progress:
-{progress} {last6m}/{target}
-
-You're {target - last6m} points away from next tier 🚀
-"""
+            f"Instagram: @{instagram}\n"
+            f"Usable points: {total}\n"
+            f"Tier: {tier}\n"
+            f"Points (6m): {last6}"
         )
         return
 
-    # =========================
-    # CHANGE HANDLE
-    # =========================
-    if text.lower() in ["change handle", "/changehandle"]:
-        context.user_data["awaiting_handle"] = True
-        await update.message.reply_text("Enter your new Instagram handle:")
+    # ================= CHANGE HANDLE =================
+    if text.lower() == "change handle":
+        context.user_data["state"] = "WAIT_HANDLE"
+        await update.message.reply_text("Enter new handle.")
         return
 
-# =========================
+    await update.message.reply_text("Unknown command")
+
+# ======================
 # RUN
-# =========================
+# ======================
 
 app = ApplicationBuilder().token(TOKEN).build()
 
