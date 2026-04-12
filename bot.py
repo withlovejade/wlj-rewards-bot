@@ -542,7 +542,9 @@ class SheetsStore:
         self.set_customer_last_synced_at(telegram_user_id, utc_now())
 
         return total_added
-def create_packaging_return(
+
+
+    def create_packaging_return(
         self,
         code: str,
         telegram_user_id: int,
