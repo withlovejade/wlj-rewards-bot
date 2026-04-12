@@ -1133,7 +1133,7 @@ async def on_startup(app: Application) -> None:
 
 async def howitworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-       (\033[1m + "How WLJ Rewards works:\n" + \033[0m)
+        "How WLJ Rewards works:\n"
         "Rewards: 50 points = $1 voucher, 100 points = $3 voucher, 500 points = $15 voucher\n\n\n"
         "- 1 embroidered pouch returned = 1 point\n\n"
         "- 1 dollar spent on a paid purchase = 1 point\n\n"
