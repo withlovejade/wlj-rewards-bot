@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -33,14 +34,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
-GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-import base64
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"].strip())
+GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"].strip()
 
 b64 = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON_B64"].strip().replace("\n", "")
 b64 += "=" * (-len(b64) % 4)
 GOOGLE_SERVICE_ACCOUNT_JSON = base64.b64decode(b64).decode("utf-8")
+
 CONTACT_ADMIN_TEXT = os.environ.get(
     "CONTACT_ADMIN_TEXT",
     "Please contact WLJ admin through your usual WLJ contact channel.",
@@ -63,9 +64,10 @@ REWARD_OPTIONS = {
 (
     MENU,
     IG_CAPTURE,
+    RETURN_PREFERRED_DATETIME,
     RETURN_POUCH_QTY,
     RETURN_CONFIRM,
-) = range(4)
+) = range(5)
 
 MENU_KEYBOARD = [
     ["Return Packaging", "Check Points"],
@@ -97,7 +99,7 @@ def parse_amount_to_points(value: str) -> int:
         return 0
     if amount < 0:
         return 0
-    return int(amount)  # 1 point per whole dollar spent
+    return int(amount)
 
 
 def parse_iso_datetime(value: str) -> Optional[datetime]:
@@ -370,6 +372,7 @@ class SheetsStore:
         telegram_user_id: int,
         telegram_username: str,
         instagram_handle: str,
+        preferred_collection_datetime: str,
         pouch_quantity: int,
     ) -> None:
         self.append_row(
@@ -379,6 +382,7 @@ class SheetsStore:
                 str(telegram_user_id),
                 telegram_username or "",
                 instagram_handle,
+                preferred_collection_datetime,
                 str(pouch_quantity),
                 str(pouch_quantity),
                 "pending",
@@ -465,23 +469,13 @@ def yes_no_markup() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([["Yes", "No"]], resize_keyboard=True, one_time_keyboard=True)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-
-    saved_instagram = get_saved_instagram(update.effective_user.id)
-    if saved_instagram:
-        return await show_main_menu(
-            update,
-            context,
-            f"Welcome back! Your saved Instagram handle is @{saved_instagram}.\n\nPlease choose an option.",
-        )
-
-    await update.effective_message.reply_text(
-        "Welcome to WLJ Rewards Family! We are so happy to have you onboard.\n\n"
-        "Please enter your Instagram handle without the @ symbol. This is required for us to log you as part of the loyalty WLJ Rewards Family.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return IG_CAPTURE
+async def show_main_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str = "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot.\n\nPlease choose an option.",
+) -> int:
+    await update.effective_message.reply_text(text, reply_markup=main_menu_markup())
+    return MENU
 
 
 def ensure_instagram_prompt(context: ContextTypes.DEFAULT_TYPE, next_action: str) -> None:
@@ -502,8 +496,7 @@ async def ask_for_instagram(
 ) -> int:
     ensure_instagram_prompt(context, next_action)
     await update.effective_message.reply_text(
-        "For us to better track your current reward points, plase enter your Instagram handle.\n"
-        "Please do not worry, we use this information only to match your WLJ purchases and contact records.",
+        "Please enter your Instagram handle without the @ symbol.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return IG_CAPTURE
@@ -511,7 +504,21 @@ async def ask_for_instagram(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    return await show_main_menu(update, context)
+
+    saved_instagram = get_saved_instagram(update.effective_user.id)
+    if saved_instagram:
+        return await show_main_menu(
+            update,
+            context,
+            f"Welcome back! Your saved Instagram handle is @{saved_instagram}.\n\nPlease choose an option.",
+        )
+
+    await update.effective_message.reply_text(
+        "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot. Nice to meet you!\n\n"
+        "For us to log your purchases backend, please enter your Instagram handle without the @ symbol. If you are a Tiktok user, you can fill in your Tiktok account username. Instagram handle is preferred.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return IG_CAPTURE
 
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -550,8 +557,11 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     next_action = context.user_data.get("pending_action")
 
     if next_action == "returnpackaging":
-        await update.message.reply_text("How many embroidered pouches are you returning?")
-        return RETURN_POUCH_QTY
+        await update.message.reply_text(
+            "Please enter your preferred date and time for collection for the coming week.\n\n"
+            "Example: Tuesday 7pm, or 18 Apr 2026 2pm"
+        )
+        return RETURN_PREFERRED_DATETIME
 
     if next_action == "checkpoints":
         return await run_checkpoints(update, context, instagram_handle)
@@ -562,8 +572,9 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return await show_main_menu(
         update,
         context,
-        f"Thank you! Your Instagram handle has been saved as @{instagram_handle}.\n\nPlease choose an option.",
+        f"Thanks! Your Instagram handle has been saved as @{instagram_handle}.\n\nPlease choose an option.",
     )
+
 
 async def returnpackaging_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     instagram_handle = get_saved_instagram(update.effective_user.id)
@@ -571,9 +582,24 @@ async def returnpackaging_entry(update: Update, context: ContextTypes.DEFAULT_TY
         return await ask_for_instagram(update, context, "returnpackaging")
 
     await update.effective_message.reply_text(
-        "How many embroidered pouches are you returning?",
+        "Please enter your preferred date and time for collection for the coming week.\n\n"
+        "Example: Tuesday 7pm, or 18 Apr 2026 2pm",
         reply_markup=ReplyKeyboardRemove(),
     )
+    return RETURN_PREFERRED_DATETIME
+
+
+async def return_preferred_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    preferred_dt = update.message.text.strip()
+
+    if not preferred_dt:
+        await update.message.reply_text(
+            "Please enter your preferred date and time for collection."
+        )
+        return RETURN_PREFERRED_DATETIME
+
+    context.user_data["preferred_collection_datetime"] = preferred_dt
+    await update.message.reply_text("How many embroidered pouches are you returning?")
     return RETURN_POUCH_QTY
 
 
@@ -632,9 +658,16 @@ async def return_pouch_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return RETURN_POUCH_QTY
 
     context.user_data["pouch_quantity"] = qty
+    preferred_dt = context.user_data.get("preferred_collection_datetime", "")
+
     await update.message.reply_text(
-        f"You are returning {qty} embroidered pouch(es).\n"
-        f"That request will be worth {qty} point(s) after admin approval.\n\n"
+        f"Please confirm your packaging return request:\n\n"
+        f"Preferred date and time: {preferred_dt}\n"
+        f"Embroidered pouches: {qty}\n"
+        f"Points to be requested after approval: {qty}\n\n"
+        "WLJ will contact you on Instagram with the arranged collection details.\n"
+        "Please remember to snap a picture of the delivery person collecting the packaging when they arrive to pick it up from you! "
+        "You will need this later when submitting for approval.\n\n"
         "Reply Yes to submit or No to cancel.",
         reply_markup=yes_no_markup(),
     )
@@ -653,6 +686,7 @@ async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     instagram_handle = get_saved_instagram(user.id) or ""
     qty = int(context.user_data["pouch_quantity"])
+    preferred_dt = context.user_data.get("preferred_collection_datetime", "").strip()
     code = make_code("RET")
 
     store.create_packaging_return(
@@ -660,6 +694,7 @@ async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         telegram_user_id=user.id,
         telegram_username=user.username or "",
         instagram_handle=instagram_handle,
+        preferred_collection_datetime=preferred_dt,
         pouch_quantity=qty,
     )
 
@@ -680,8 +715,10 @@ async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     summary += (
         f"Instagram: @{instagram_handle}\n"
+        f"Please state your preferred collection date/time for the following week: {preferred_dt}\n"
         f"Embroidered pouches: {qty}\n"
-        f"Points requested: {qty}"
+        f"Points requested: {qty}\n\n"
+        "Please arrange collection through Instagram backend."
     )
 
     await context.bot.send_message(
@@ -693,7 +730,11 @@ async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return await show_main_menu(
         update,
         context,
-        f"Your packaging return request has been submitted.\n\nRequest code: {code}\n\nYou’re back at the main menu.",
+        "Your packaging return request has been submitted.\n\n"
+        f"Request code: {code}\n\n"
+        "WLJ will contact you on Instagram/Tiktok with the arranged collection details.\n"
+        "Please remember to snap a picture of the delivery person when they collect the packaging.\n\n"
+        "You’re back at the main menu.",
     )
 
 
@@ -755,7 +796,7 @@ async def redeem_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if balance < points:
         await query.edit_message_text(
-            f"You currently have {balance} point(s), which is not enough for this reward."
+            f"You currently have {balance} point(s), which is not enough for this reward. Don't be sad! You can slowly collect more points!"
         )
         return
 
@@ -810,7 +851,7 @@ async def redeem_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Points deducted: {points}\n"
         f"Current balance: {new_balance}\n"
         f"Valid until: {expires_dt.date().isoformat()}\n\n"
-        "Please keep this code safe.\n"
+        "Please keep this code safe as you will need to send this to the admin team on Instagram to offset your payment.\n"
         "Reply /redeemrewards to redeem more points."
     )
 
@@ -827,11 +868,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if kind == "pr":
         await handle_packaging_admin_action(query, context, action, code)
-        return
-
-    if kind == "markredeemed":
-        await mark_redeemed(update, context)
-        return
 
 
 async def handle_packaging_admin_action(query, context, action: str, code: str) -> None:
@@ -886,7 +922,10 @@ async def handle_packaging_admin_action(query, context, action: str, code: str) 
     await query.edit_message_text(f"Rejected packaging return {code}.")
     await context.bot.send_message(
         chat_id=user_id,
-        text=f"Your packaging return request {code} was rejected.",
+        text=(
+            f"Unfortunately, your packaging return request {code} was rejected likely because of a technical issue.\n"
+            "No points were added. Please contact WLJ admin if you need clarification and assistance!"
+        ),
     )
 
 
@@ -1094,17 +1133,21 @@ async def on_startup(app: Application) -> None:
 
 async def howitworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        "How WLJ Rewards works:\n\n"
-        "- 1 embroidered pouch returned = 1 point\n"
-        "- 1 dollar spent on a paid purchase = 1 point\n"
-        "- Purchase points are synced automatically from WLJ's paid purchase records\n"
-        "- Packaging returns need admin approval\n"
-        "- Rewards are issued as unique voucher codes\n"
-        "- Voucher redemptions deduct points immediately\n"
-        "- Each voucher is valid for 30 days from the points exchange date\n"
-        "- Unused vouchers expire automatically after 30 days\n"
-        "- The bot sends reminder messages 7 days before expiry and 1 day before expiry\n"
-        "- Rewards: 50 points = $1 voucher, 100 points = $3 voucher, 500 points = $15 voucher"
+       (\033[1m + "How WLJ Rewards works:\n" + \033[0m)
+        "Rewards: 50 points = $1 voucher, 100 points = $3 voucher, 500 points = $15 voucher\n\n\n"
+        "- 1 embroidered pouch returned = 1 point\n\n"
+        "- 1 dollar spent on a paid purchase = 1 point\n\n"
+        "- Purchase points are synced automatically from WLJ's paid purchase records\n\n"
+        "- Packaging returns need admin approval\n\n"
+        "- For packaging returns, please submit your preferred date and time for the coming week\n\n"
+        "- WLJ will contact you on Instagram with collection details\n\n"
+        "- Please snap a picture of the delivery person when they collect the packaging. You will need this later for approval support\n\n"
+        "- Rewards are issued as unique voucher codes\n\n"
+        "- Voucher redemptions deduct points immediately\n\n"
+        "- Each voucher is valid for 30 days from the points exchange date\n\n"
+        "- Unused vouchers expire automatically after 30 days\n\n"
+        "- The bot sends reminder messages 7 days before expiry and 1 day before expiry"
+      
     )
     return await show_main_menu(update, context, "You’re back at the main menu.")
 
@@ -1140,6 +1183,7 @@ def main() -> None:
         states={
             MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler)],
             IG_CAPTURE: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_instagram)],
+            RETURN_PREFERRED_DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, return_preferred_datetime)],
             RETURN_POUCH_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, return_pouch_qty)],
             RETURN_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, return_confirm)],
         },
