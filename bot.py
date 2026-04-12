@@ -879,21 +879,21 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "18 Apr 2026, 2pm"
         )
         return RETURN_PREFERRED_DATETIME
-
-    if next_action == "checkpoints":
-        context.user_data.pop("pending_action", None)
-        return await run_checkpoints(update, context, instagram_handle)
-
-    if next_action == "redeemrewards":
-        context.user_data.pop("pending_action", None)
-        return await run_redeem_entry(update, context, instagram_handle)
-
+if next_action == "checkpoints":
     context.user_data.pop("pending_action", None)
-        return await show_main_menu(
-        update,
-        context,
-        f"Thanks! Your birthday has been saved.\n\nPlease choose an option.",
-    )
+    return await run_checkpoints(update, context, instagram_handle)
+
+if next_action == "redeemrewards":
+    context.user_data.pop("pending_action", None)
+    return await run_redeem_entry(update, context, instagram_handle)
+
+context.user_data.pop("pending_action", None)
+return await show_main_menu(
+    update,
+    context,
+    "Thanks! Your birthday has been saved.\n\nPlease choose an option.",
+)
+   
 
 
 # =========================
