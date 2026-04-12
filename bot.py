@@ -477,8 +477,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
 
     await update.effective_message.reply_text(
-        "Welcome to WLJ Rewards Bot.\n\n"
-        "Please enter your Instagram handle without the @ symbol.",
+        "Welcome to WLJ Rewards Family! We are so happy to have you onboard.\n\n"
+        "Please enter your Instagram handle without the @ symbol. This is required for us to log you as part of the loyalty WLJ Rewards Family.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return IG_CAPTURE
