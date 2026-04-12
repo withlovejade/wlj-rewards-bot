@@ -853,7 +853,6 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return BIRTHDAY_CAPTURE
 
     user = update.effective_user
-
     store.update_customer_fields(
         user.id,
         {
@@ -863,11 +862,7 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
     next_action = context.user_data.get("pending_action")
-    instagram_handle = (
-        context.user_data.get("instagram_handle")
-        or get_saved_instagram(user.id)
-        or ""
-    )
+    instagram_handle = get_saved_instagram(user.id) or context.user_data.get("instagram_handle", "")
 
     if next_action == "returnpackaging":
         context.user_data.pop("pending_action", None)
@@ -879,21 +874,21 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "18 Apr 2026, 2pm"
         )
         return RETURN_PREFERRED_DATETIME
-if next_action == "checkpoints":
-    context.user_data.pop("pending_action", None)
-    return await run_checkpoints(update, context, instagram_handle)
 
-if next_action == "redeemrewards":
-    context.user_data.pop("pending_action", None)
-    return await run_redeem_entry(update, context, instagram_handle)
+    if next_action == "checkpoints":
+        context.user_data.pop("pending_action", None)
+        return await run_checkpoints(update, context, instagram_handle)
 
-context.user_data.pop("pending_action", None)
-return await show_main_menu(
-    update,
-    context,
-    "Thanks! Your birthday has been saved.\n\nPlease choose an option.",
-)
-   
+    if next_action == "redeemrewards":
+        context.user_data.pop("pending_action", None)
+        return await run_redeem_entry(update, context, instagram_handle)
+
+    context.user_data.pop("pending_action", None)
+    return await show_main_menu(
+        update,
+        context,
+        "Thanks! Your birthday has been saved.\n\nPlease choose an option.",
+    )
 
 
 # =========================
