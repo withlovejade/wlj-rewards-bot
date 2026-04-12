@@ -1,1905 +1,261 @@
-import asyncio
-import base64
-import json
-import logging
 import os
-import uuid
-from calendar import monthrange
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
-from typing import Dict, List, Optional, Tuple
+import json
+import datetime
+import base64
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    Update,
-)
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-)
+# =========================
+# CONFIG
+# =========================
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
-ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"].strip())
-GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"].strip()
-
-b64 = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON_B64"].strip().replace("\n", "")
-b64 += "=" * (-len(b64) % 4)
-GOOGLE_SERVICE_ACCOUNT_JSON = base64.b64decode(b64).decode("utf-8")
-
-CONTACT_ADMIN_TEXT = os.environ.get(
-    "CONTACT_ADMIN_TEXT",
-    "Please contact WLJ admin through your usual WLJ contact channel.",
-)
+# decode service account JSON
+SERVICE_JSON = json.loads(base64.b64decode(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]))
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+creds = Credentials.from_service_account_info(SERVICE_JSON, scopes=SCOPES)
+service = build("sheets", "v4", credentials=creds)
+
 CUSTOMERS_SHEET = "Customers"
 PURCHASES_SHEET = "2026 Purchases"
-LEDGER_SHEET = "Ledger"
-PACKAGING_RETURNS_SHEET = "Packaging Returns"
-REDEMPTIONS_SHEET = "Redemptions"
-BIRTHDAY_VOUCHERS_SHEET = "Birthday Vouchers"
 
-REWARD_OPTIONS = {
-    50: "$1 voucher",
-    100: "$3 voucher",
-    500: "$15 voucher",
-}
-
-TIER_THRESHOLDS = {
-    "Bean": 0,
-    "Water": 1500,
-    "Icy": 3000,
-    "Glassy": 10000,
-}
-
-TIER_ORDER = ["Bean", "Water", "Icy", "Glassy"]
-
-PURCHASE_MULTIPLIERS = {
-    "Bean": Decimal("1.0"),
-    "Water": Decimal("1.5"),
-    "Icy": Decimal("2.0"),
-    "Glassy": Decimal("3.0"),
-}
-
-(
-    MENU,
-    IG_CAPTURE,
-    BIRTHDAY_CAPTURE,
-    CHANGE_HANDLE_CAPTURE,
-    RETURN_PREFERRED_DATETIME,
-    RETURN_POUCH_QTY,
-    RETURN_CONFIRM,
-) = range(7)
-
-MENU_KEYBOARD = [
-    ["Return Packaging", "Check Points"],
-    ["Redeem Rewards", "How It Works"],
-    ["Change Handle", "Contact Admin"],
-]
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def now_dt() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
-
-
-def make_code(prefix: str) -> str:
-    return f"{prefix}-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
-
-
-def make_birthday_code() -> str:
-    return f"BIRTHDAY-{datetime.now(timezone.utc).strftime('%Y%m')}-{uuid.uuid4().hex[:6].upper()}"
-
+# =========================
+# HELPERS
+# =========================
 
 def normalize_instagram(value: str) -> str:
-    return str(value).strip().lower().lstrip("@")
+    return value.strip().lower().lstrip("@")
 
+def now():
+    return datetime.datetime.utcnow().isoformat()
 
-def normalize_telegram_id(value) -> str:
-    raw = str(value).strip()
-    if raw.endswith(".0"):
-        raw = raw[:-2]
-    return raw
+def get_sheet(sheet):
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"{sheet}!A:Z"
+    ).execute()
+    values = result.get("values", [])
+    headers = values[0]
+    rows = values[1:]
+    return headers, rows
 
+def append_row(sheet, row):
+    service.spreadsheets().values().append(
+        spreadsheetId=SHEET_ID,
+        range=f"{sheet}!A:Z",
+        valueInputOption="RAW",
+        body={"values": [row]}
+    ).execute()
 
-def parse_int(value: str) -> int:
-    return int(str(value).strip())
+def update_cell(sheet, row_index, col_index, value):
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range=f"{sheet}!{chr(65+col_index)}{row_index+2}",
+        valueInputOption="RAW",
+        body={"values": [[value]]}
+    ).execute()
 
+# =========================
+# CUSTOMER FUNCTIONS
+# =========================
 
-def parse_amount_to_points(value: str) -> int:
-    raw = str(value).strip()
-    raw = raw.replace("$", "").replace(",", "").replace("SGD", "").strip()
+def find_customer(telegram_id):
+    headers, rows = get_sheet(CUSTOMERS_SHEET)
+    for i, row in enumerate(rows):
+        if len(row) > 0 and row[0] == str(telegram_id):
+            return headers, row, i
+    return headers, None, None
 
-    try:
-        amount = Decimal(raw)
-    except InvalidOperation:
-        return 0
+def create_customer(user):
+    append_row(CUSTOMERS_SHEET, [
+        user.id,
+        user.username or "",
+        "",
+        "",
+        0,
+        "Bean",
+        0,
+        now(),
+        now(),
+        "",
+        ""
+    ])
 
-    if amount < 0:
-        return 0
+# =========================
+# POINTS LOGIC
+# =========================
 
-    return int(amount)
-
-
-def parse_iso_datetime(value: str) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        return None
-
-
-def parse_birthday_ddmmyyyy(value: str) -> Optional[str]:
-    try:
-        return datetime.strptime(str(value).strip(), "%d-%m-%Y").strftime("%d-%m-%Y")
-    except ValueError:
-        return None
-
-
-def get_tier_name(points_6m: int) -> str:
-    if points_6m >= TIER_THRESHOLDS["Glassy"]:
+def get_tier(points):
+    if points >= 10000:
         return "Glassy"
-    if points_6m >= TIER_THRESHOLDS["Icy"]:
+    elif points >= 3000:
         return "Icy"
-    if points_6m >= TIER_THRESHOLDS["Water"]:
+    elif points >= 1500:
         return "Water"
     return "Bean"
 
-
-def get_next_tier(points_6m: int) -> Optional[tuple]:
-    current = get_tier_name(points_6m)
-    current_index = TIER_ORDER.index(current)
-    if current_index == len(TIER_ORDER) - 1:
-        return None
-    next_tier = TIER_ORDER[current_index + 1]
-    return next_tier, TIER_THRESHOLDS[next_tier]
-
-
-def make_progress_bar(current: int, target: int, length: int = 10) -> str:
-    if target <= 0:
-        return "█" * length
-    ratio = max(0, min(current / target, 1))
-    filled = int(ratio * length)
-    return "█" * filled + "░" * (length - filled)
-
-
-def end_of_birthday_month(year: int, month: int) -> datetime:
-    last_day = monthrange(year, month)[1]
-    return datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
-
-
-class SheetsStore:
-    def __init__(self, spreadsheet_id: str, service_account_json: str):
-        info = json.loads(service_account_json)
-        credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
-        self.service = build(
-            "sheets",
-            "v4",
-            credentials=credentials,
-            cache_discovery=False,
-        )
-        self.spreadsheet_id = spreadsheet_id
-
-    def read_sheet(self, sheet_name: str) -> Tuple[List[str], List[Dict[str, str]]]:
-        result = (
-            self.service.spreadsheets()
-            .values()
-            .get(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"{sheet_name}!A:Z",
-                valueRenderOption="UNFORMATTED_VALUE",
-            )
-            .execute()
-        )
-        values = result.get("values", [])
-        if not values:
-            return [], []
-
-        headers = values[0]
-        rows = []
-        for row in values[1:]:
-            row_dict = {}
-            for i, header in enumerate(headers):
-                row_dict[header] = row[i] if i < len(row) else ""
-            rows.append(row_dict)
-        return headers, rows
-
-    def append_row(self, sheet_name: str, values: List[str]) -> None:
-        body = {"values": [values]}
-        (
-            self.service.spreadsheets()
-            .values()
-            .append(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"{sheet_name}!A:Z",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body=body,
-            )
-            .execute()
-        )
-
-    def update_row_by_key(
-        self,
-        sheet_name: str,
-        key_column: str,
-        key_value: str,
-        updates: Dict[str, str],
-    ) -> bool:
-        headers, rows = self.read_sheet(sheet_name)
-        if not headers:
-            return False
-
-        target = normalize_telegram_id(key_value) if key_column == "telegram_user_id" else str(key_value)
-
-        for row_index, row in enumerate(rows, start=2):
-            current = row.get(key_column, "")
-            current = normalize_telegram_id(current) if key_column == "telegram_user_id" else str(current)
-            if current == target:
-                new_row = [row.get(header, "") for header in headers]
-                for col_name, new_value in updates.items():
-                    if col_name in headers:
-                        idx = headers.index(col_name)
-                        new_row[idx] = str(new_value)
-                body = {"values": [new_row]}
-                (
-                    self.service.spreadsheets()
-                    .values()
-                    .update(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f"{sheet_name}!A{row_index}:Z{row_index}",
-                        valueInputOption="USER_ENTERED",
-                        body=body,
-                    )
-                    .execute()
-                )
-                return True
-        return False
-
-    def get_customer_by_telegram_id(self, telegram_user_id: int) -> Optional[Dict[str, str]]:
-        target = normalize_telegram_id(telegram_user_id)
-        _, rows = self.read_sheet(CUSTOMERS_SHEET)
-        for row in rows:
-            if normalize_telegram_id(row.get("telegram_user_id", "")) == target:
-                return row
-        return None
-
-    def get_all_customers(self) -> List[Dict[str, str]]:
-        _, rows = self.read_sheet(CUSTOMERS_SHEET)
-        return rows
-
-    def upsert_customer(
-        self,
-        telegram_user_id: int,
-        telegram_username: str,
-        instagram_handle: str,
-    ) -> None:
-        existing = self.get_customer_by_telegram_id(telegram_user_id)
-        if existing:
-            self.update_customer_fields(
-                telegram_user_id,
-                {
-                    "telegram_username": telegram_username or "",
-                    "instagram_handle": instagram_handle,
-                    "last_activity_at": utc_now(),
-                },
-            )
-            return
-
-        self.append_row(
-            CUSTOMERS_SHEET,
-            [
-                str(telegram_user_id),
-                telegram_username or "",
-                instagram_handle,
-                "",          # birthday
-                "0",         # points_balance
-                "Bean",      # tier
-                "0",         # tier_points_6m
-                utc_now(),   # created_at
-                utc_now(),   # last_activity_at
-                "",          # last_synced_at
-                "",          # last_tier_update
-            ],
-        )
-
-    def update_customer_fields(self, telegram_user_id: int, updates: Dict[str, str]) -> None:
-        target = normalize_telegram_id(telegram_user_id)
-        headers, rows = self.read_sheet(CUSTOMERS_SHEET)
-        if not headers:
-            return
-
-        for row_index, row in enumerate(rows, start=2):
-            if normalize_telegram_id(row.get("telegram_user_id", "")) == target:
-                new_row = [row.get(header, "") for header in headers]
-                for col_name, new_value in updates.items():
-                    if col_name in headers:
-                        idx = headers.index(col_name)
-                        new_row[idx] = str(new_value)
-
-                body = {"values": [new_row]}
-                (
-                    self.service.spreadsheets()
-                    .values()
-                    .update(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f"{CUSTOMERS_SHEET}!A{row_index}:Z{row_index}",
-                        valueInputOption="USER_ENTERED",
-                        body=body,
-                    )
-                    .execute()
-                )
-                return
-
-    def get_points_balance(self, telegram_user_id: int) -> int:
-        customer = self.get_customer_by_telegram_id(telegram_user_id)
-        if not customer:
-            return 0
-        try:
-            return int(str(customer.get("points_balance", "0") or "0"))
-        except ValueError:
-            return 0
-
-    def set_points_balance(self, telegram_user_id: int, new_balance: int) -> None:
-        self.update_customer_fields(
-            telegram_user_id,
-            {
-                "points_balance": str(new_balance),
-                "last_activity_at": utc_now(),
-            },
-        )
-
-    def set_customer_last_synced_at(self, telegram_user_id: int, synced_at: str) -> None:
-        self.update_customer_fields(
-            telegram_user_id,
-            {
-                "last_synced_at": synced_at,
-            },
-        )
-
-    def add_ledger_entry(
-        self,
-        telegram_user_id: int,
-        instagram_handle: str,
-        tx_type: str,
-        reference_code: str,
-        points_change: int,
-        notes: str,
-        status: str = "approved",
-        expires_at: str = "",
-        expired_flag: str = "no",
-    ) -> str:
-        tx_id = make_code("TX")
-        self.append_row(
-            LEDGER_SHEET,
-            [
-                tx_id,
-                str(telegram_user_id),
-                instagram_handle,
-                tx_type,
-                reference_code,
-                str(points_change),
-                status,
-                notes,
-                utc_now(),
-                expires_at,
-                expired_flag,
-            ],
-        )
-        return tx_id
-
-    def add_points(
-        self,
-        telegram_user_id: int,
-        instagram_handle: str,
-        points: int,
-        tx_type: str,
-        reference_code: str,
-        notes: str,
-        status: str = "approved",
-        expires_at: str = "",
-        expired_flag: str = "no",
-    ) -> int:
-        current = self.get_points_balance(telegram_user_id)
-        new_balance = current + points
-        self.set_points_balance(telegram_user_id, new_balance)
-        self.add_ledger_entry(
-            telegram_user_id=telegram_user_id,
-            instagram_handle=instagram_handle,
-            tx_type=tx_type,
-            reference_code=reference_code,
-            points_change=points,
-            notes=notes,
-            status=status,
-            expires_at=expires_at,
-            expired_flag=expired_flag,
-        )
-        return new_balance
-
-    def get_recent_ledger(self, telegram_user_id: int, limit: int = 5) -> List[Dict[str, str]]:
-        target = normalize_telegram_id(telegram_user_id)
-        _, rows = self.read_sheet(LEDGER_SHEET)
-        filtered = [
-            row for row in rows
-            if normalize_telegram_id(row.get("telegram_user_id", "")) == target
-        ]
-        return filtered[-limit:]
-
-    def get_tier_points_6m(self, telegram_user_id: int) -> int:
-        target = normalize_telegram_id(telegram_user_id)
-        _, rows = self.read_sheet(LEDGER_SHEET)
-        cutoff = datetime.now(timezone.utc) - timedelta(days=183)
-        total = 0
-
-        for row in rows:
-            if normalize_telegram_id(row.get("telegram_user_id", "")) != target:
-                continue
-            if str(row.get("type", "")).strip() != "purchase":
-                continue
-
-            created_at = parse_iso_datetime(str(row.get("created_at", "")))
-            if not created_at or created_at < cutoff:
-                continue
-
-            try:
-                pts = int(str(row.get("points_change", "0") or "0"))
-            except ValueError:
-                pts = 0
-
-            if pts > 0:
-                total += pts
-
-        return total
-
-    def update_customer_tier(self, telegram_user_id: int) -> tuple:
-        points_6m = self.get_tier_points_6m(telegram_user_id)
-        tier = get_tier_name(points_6m)
-        self.update_customer_fields(
-            telegram_user_id,
-            {
-                "tier": tier,
-                "tier_points_6m": str(points_6m),
-                "last_tier_update": utc_now(),
-            },
-        )
-        return tier, points_6m
-
-    def sync_purchase_points(self, telegram_user_id: int, instagram_handle: str) -> int:
-        _, rows = self.read_sheet(PURCHASES_SHEET)
-        total_added = 0
-        normalized_ig = normalize_instagram(instagram_handle)
-
-        current_tier, _ = self.update_customer_tier(telegram_user_id)
-        multiplier = PURCHASE_MULTIPLIERS[current_tier]
-
-        for row in rows:
-            purchase_ig = normalize_instagram(str(row.get("instagram_handle", "")))
-            if purchase_ig != normalized_ig:
-                continue
-
-            payment_status = str(row.get("payment_status", "")).strip().lower()
-            points_awarded = str(row.get("points_awarded", "")).strip().lower()
-
-            if payment_status != "paid":
-                continue
-            if points_awarded == "yes":
-                continue
-
-            purchase_id = str(row.get("purchase_id", "")).strip()
-            if not purchase_id:
-                continue
-
-            base_points = parse_amount_to_points(row.get("amount_paid", "0"))
-            if base_points <= 0:
-                self.update_row_by_key(
-                    PURCHASES_SHEET,
-                    "purchase_id",
-                    purchase_id,
-                    {
-                        "notes": "Points not synced because amount_paid was invalid or zero.",
-                    },
-                )
-                continue
-
-            awarded_points = int((Decimal(base_points) * multiplier).to_integral_value(rounding="ROUND_FLOOR"))
-            expires_at = (now_dt() + timedelta(days=183)).isoformat()
-
-            self.add_points(
-                telegram_user_id=telegram_user_id,
-                instagram_handle=instagram_handle,
-                points=awarded_points,
-                tx_type="purchase",
-                reference_code=purchase_id,
-                notes=f"Purchase reward for paid purchase {purchase_id} at tier {current_tier} ({multiplier}x)",
-                expires_at=expires_at,
-                expired_flag="no",
-            )
-
-            self.update_row_by_key(
-                PURCHASES_SHEET,
-                "purchase_id",
-                purchase_id,
-                {
-                    "points_awarded": "yes",
-                    "points_awarded_at": utc_now(),
-                    "notes": f"Synced at tier {current_tier} with {multiplier}x multiplier.",
-                },
-            )
-            total_added += awarded_points
-
-            current_tier, _ = self.update_customer_tier(telegram_user_id)
-            multiplier = PURCHASE_MULTIPLIERS[current_tier]
-
-        self.set_customer_last_synced_at(telegram_user_id, utc_now())
-        self.update_customer_tier(telegram_user_id)
-        return total_added
-
-    def create_packaging_return(
-        self,
-        code: str,
-        telegram_user_id: int,
-        telegram_username: str,
-        instagram_handle: str,
-        preferred_collection_datetime: str,
-        pouch_quantity: int,
-    ) -> None:
-        self.append_row(
-            PACKAGING_RETURNS_SHEET,
-            [
-                code,
-                str(telegram_user_id),
-                telegram_username or "",
-                instagram_handle,
-                preferred_collection_datetime,
-                str(pouch_quantity),
-                str(pouch_quantity),
-                "pending",
-                "",
-                utc_now(),
-                "",
-            ],
-        )
-
-    def get_packaging_return(self, code: str) -> Optional[Dict[str, str]]:
-        _, rows = self.read_sheet(PACKAGING_RETURNS_SHEET)
-        for row in rows:
-            if str(row.get("return_request_code", "")) == str(code):
-                return row
-        return None
-
-    def update_packaging_return(self, code: str, updates: Dict[str, str]) -> bool:
-        return self.update_row_by_key(
-            PACKAGING_RETURNS_SHEET,
-            "return_request_code",
-            code,
-            updates,
-        )
-
-    def create_redemption(
-        self,
-        code: str,
-        telegram_user_id: int,
-        telegram_username: str,
-        instagram_handle: str,
-        reward_points: int,
-        reward_value: str,
-        issued_at: str,
-        expires_at: str,
-    ) -> None:
-        self.append_row(
-            REDEMPTIONS_SHEET,
-            [
-                code,
-                str(telegram_user_id),
-                telegram_username or "",
-                instagram_handle,
-                str(reward_points),
-                reward_value,
-                issued_at,
-                expires_at,
-                "active",
-                "",
-                "no",
-                "no",
-                "no",
-                "",
-            ],
-        )
-
-    def get_redemption(self, code: str) -> Optional[Dict[str, str]]:
-        _, rows = self.read_sheet(REDEMPTIONS_SHEET)
-        for row in rows:
-            if str(row.get("redemption_code", "")) == str(code):
-                return row
-        return None
-
-    def get_all_redemptions(self) -> List[Dict[str, str]]:
-        _, rows = self.read_sheet(REDEMPTIONS_SHEET)
-        return rows
-
-    def update_redemption(self, code: str, updates: Dict[str, str]) -> bool:
-        return self.update_row_by_key(
-            REDEMPTIONS_SHEET,
-            "redemption_code",
-            code,
-            updates,
-        )
-
-    def create_birthday_voucher(
-        self,
-        code: str,
-        telegram_user_id: int,
-        telegram_username: str,
-        instagram_handle: str,
-        issued_at: str,
-        expires_at: str,
-        year_issued: str,
-    ) -> None:
-        self.append_row(
-            BIRTHDAY_VOUCHERS_SHEET,
-            [
-                code,
-                str(telegram_user_id),
-                telegram_username or "",
-                instagram_handle,
-                "$18 off any purchase",
-                issued_at,
-                expires_at,
-                "active",
-                "",
-                year_issued,
-                "no",
-                "no",
-                "",
-            ],
-        )
-
-    def get_all_birthday_vouchers(self) -> List[Dict[str, str]]:
-        _, rows = self.read_sheet(BIRTHDAY_VOUCHERS_SHEET)
-        return rows
-
-    def get_birthday_voucher(self, code: str) -> Optional[Dict[str, str]]:
-        _, rows = self.read_sheet(BIRTHDAY_VOUCHERS_SHEET)
-        for row in rows:
-            if str(row.get("birthday_code", "")) == str(code):
-                return row
-        return None
-
-    def update_birthday_voucher(self, code: str, updates: Dict[str, str]) -> bool:
-        return self.update_row_by_key(
-            BIRTHDAY_VOUCHERS_SHEET,
-            "birthday_code",
-            code,
-            updates,
-        )
-
-
-store = SheetsStore(GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON)
-
-
-def main_menu_markup() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(MENU_KEYBOARD, resize_keyboard=True)
-
-
-def yes_no_markup() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([["Yes", "No"]], resize_keyboard=True, one_time_keyboard=True)
-
-
-async def show_main_menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str = "Welcome to WLJ Rewards Bot.\n\nPlease choose an option.",
-) -> int:
-    await update.effective_message.reply_text(text, reply_markup=main_menu_markup())
-    return MENU
-
-
-def ensure_instagram_prompt(context: ContextTypes.DEFAULT_TYPE, next_action: str) -> None:
-    context.user_data["pending_action"] = next_action
-
-
-def get_saved_instagram(user_id: int) -> Optional[str]:
-    customer = store.get_customer_by_telegram_id(user_id)
-    if customer and str(customer.get("instagram_handle", "")).strip():
-        return str(customer["instagram_handle"]).strip()
-    return None
-
-
-async def ask_for_instagram(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    next_action: str,
-) -> int:
-    ensure_instagram_prompt(context, next_action)
-    await update.effective_message.reply_text(
-        "Please enter your Instagram handle without the @ symbol.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return IG_CAPTURE
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-
-    customer = store.get_customer_by_telegram_id(update.effective_user.id)
-
-    if customer:
-        saved_instagram = str(customer.get("instagram_handle", "")).strip()
-        saved_birthday = str(customer.get("birthday", "")).strip()
-
-        if saved_instagram and saved_birthday:
-            return await show_main_menu(
-                update,
-                context,
-                f"Welcome back! Your saved Instagram handle is @{saved_instagram}.\n\nPlease choose an option.",
-            )
-
-        if saved_instagram and not saved_birthday:
-            await update.effective_message.reply_text(
-                "Please enter your birthday in DD-MM-YYYY format.\n\n"
-                "Example:\n"
-                "14-09-1996\n\n"
-                "We use this to issue your WLJ birthday voucher later.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            return BIRTHDAY_CAPTURE
-
-    await update.effective_message.reply_text(
-        "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot. Nice to meet you!\n\n"
-        "For us to log your purchases backend, please enter your Instagram handle without the @ symbol. "
-        "If you are a Tiktok user, you can fill in your Tiktok account username. Instagram handle is preferred.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return IG_CAPTURE
-
-
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    choice = update.message.text.strip()
-
-    if choice == "Return Packaging":
-        return await returnpackaging_entry(update, context)
-    if choice == "Check Points":
-        return await checkpoints_entry(update, context)
-    if choice == "Redeem Rewards":
-        return await redeemrewards_entry(update, context)
-    if choice == "How It Works":
-        return await howitworks(update, context)
-    if choice == "Contact Admin":
-        return await contactadmin(update, context)
-    if choice == "Change Handle":
-        return await changehandle(update, context)
-
-    return await show_main_menu(update, context, "Please choose one of the menu options.")
-
-
-async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    instagram_handle = normalize_instagram(update.message.text)
-    user = update.effective_user
-
-    if not instagram_handle:
-        await update.message.reply_text(
-            "Please enter your Instagram handle without the @ symbol."
-        )
-        return IG_CAPTURE
-
-    store.upsert_customer(
-        telegram_user_id=user.id,
-        telegram_username=user.username or "",
-        instagram_handle=instagram_handle,
-    )
-
-    customer = store.get_customer_by_telegram_id(user.id)
-    saved_birthday = str(customer.get("birthday", "")).strip() if customer else ""
-
-    context.user_data["instagram_handle"] = instagram_handle
-
-    if not saved_birthday:
-        await update.message.reply_text(
-            "Please enter your birthday in DD-MM-YYYY format.\n\n"
-            "Example:\n"
-            "14-09-1996\n\n"
-            "We use this to issue your WLJ birthday voucher later."
-        )
-        return BIRTHDAY_CAPTURE
-
-    next_action = context.user_data.get("pending_action")
-
-    if next_action == "returnpackaging":
-        await update.message.reply_text(
-            "Please enter your preferred collection date and time for the coming week.\n\n"
-            "Example:\n"
-            "Tuesday 7pm\n"
-            "or\n"
-            "18 Apr 2026, 2pm"
-        )
-        return RETURN_PREFERRED_DATETIME
-
-    if next_action == "checkpoints":
-        return await run_checkpoints(update, context, instagram_handle)
-
-    if next_action == "redeemrewards":
-        return await run_redeem_entry(update, context, instagram_handle)
-
-    context.user_data.pop("pending_action", None)
-    return await show_main_menu(
-        update,
-        context,
-        f"Thanks! Your Instagram handle has been saved as @{instagram_handle}.\n\nPlease choose an option.",
-    )
-
-
-async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    birthday = parse_birthday_ddmmyyyy(update.message.text)
-
-    if not birthday:
-        await update.message.reply_text(
-            "Please enter your birthday in DD-MM-YYYY format.\n\n"
-            "Example:\n"
-            "14-09-1996"
-        )
-        return BIRTHDAY_CAPTURE
-
-    user = update.effective_user
-    store.update_customer_fields(
-        user.id,
-        {
-            "birthday": birthday,
-            "last_activity_at": utc_now(),
-        },
-    )
-
-    next_action = context.user_data.get("pending_action")
-    instagram_handle = get_saved_instagram(user.id) or context.user_data.get("instagram_handle", "")
-
-    if next_action == "returnpackaging":
-        context.user_data.pop("pending_action", None)
-        await update.message.reply_text(
-            "Please enter your preferred collection date and time for the coming week.\n\n"
-            "Example:\n"
-            "Tuesday 7pm\n"
-            "or\n"
-            "18 Apr 2026, 2pm"
-        )
-        return RETURN_PREFERRED_DATETIME
-
-    if next_action == "checkpoints":
-        context.user_data.pop("pending_action", None)
-        return await run_checkpoints(update, context, instagram_handle)
-
-    if next_action == "redeemrewards":
-        context.user_data.pop("pending_action", None)
-        return await run_redeem_entry(update, context, instagram_handle)
-
-    context.user_data.pop("pending_action", None)
-    return await show_main_menu(
-        update,
-        context,
-        f"Thanks! Your birthday has been saved as {birthday}.\n\nPlease choose an option.",
-    )
-
-
-async def changehandle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["pending_action"] = "changehandle"
-    await update.effective_message.reply_text(
-        "Please enter your new Instagram handle without the @ symbol.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return CHANGE_HANDLE_CAPTURE
-
-
-async def capture_changed_handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    instagram_handle = normalize_instagram(update.message.text)
-    user = update.effective_user
-
-    if not instagram_handle:
-        await update.message.reply_text(
-            "Please enter your Instagram handle without the @ symbol."
-        )
-        return CHANGE_HANDLE_CAPTURE
-
-    store.update_customer_fields(
-        user.id,
-        {
-            "instagram_handle": instagram_handle,
-            "last_activity_at": utc_now(),
-        },
-    )
-
-    context.user_data.pop("pending_action", None)
-    return await show_main_menu(
-        update,
-        context,
-        f"Done. Your saved Instagram handle has been updated to @{instagram_handle}.",
-    )
-
-
-async def returnpackaging_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    instagram_handle = get_saved_instagram(update.effective_user.id)
-
-    if not instagram_handle:
-        return await ask_for_instagram(update, context, "returnpackaging")
-
-    context.user_data["instagram_handle"] = instagram_handle
-
-    await update.effective_message.reply_text(
-        "Please enter your preferred collection date and time for the coming week.\n\n"
-        "Example:\n"
-        "Tuesday 7pm\n"
-        "or\n"
-        "18 Apr 2026, 2pm",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return RETURN_PREFERRED_DATETIME
-
-
-async def return_preferred_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    preferred_dt = update.message.text.strip()
-
-    if not preferred_dt:
-        await update.message.reply_text(
-            "Please enter your preferred collection date and time."
-        )
-        return RETURN_PREFERRED_DATETIME
-
-    context.user_data["preferred_collection_datetime"] = preferred_dt
-
-    await update.message.reply_text(
-        "How many embroidered pouches are you returning?"
-    )
-    return RETURN_POUCH_QTY
-
-
-async def return_pouch_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        qty = parse_int(update.message.text)
-    except ValueError:
-        await update.message.reply_text(
-            "Please enter a whole number, such as 1, 2, or 5."
-        )
-        return RETURN_POUCH_QTY
-
-    if qty <= 0:
-        await update.message.reply_text(
-            "Please enter a number greater than 0."
-        )
-        return RETURN_POUCH_QTY
-
-    context.user_data["pouch_quantity"] = qty
-
-    instagram_handle = context.user_data.get("instagram_handle", "")
-    preferred_dt = context.user_data.get("preferred_collection_datetime", "")
-
-    await update.message.reply_text(
-        "Please review your request:\n\n"
-        f"Instagram handle: @{instagram_handle}\n"
-        f"Preferred collection date and time: {preferred_dt}\n"
-        f"Number of embroidered pouches: {qty}\n"
-        f"Points to be requested after approval: {qty}\n\n"
-        "WLJ will contact you on Instagram with the arranged collection details.\n\n"
-        "Important:\n"
-        "Please snap a picture of the delivery person when they come to collect the packaging. "
-        "You may need this later for approval support.\n\n"
-        "Reply Yes to submit or No to cancel.",
-        reply_markup=yes_no_markup(),
-    )
-    return RETURN_CONFIRM
-
-
-async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    answer = update.message.text.strip().lower()
-
-    if answer not in ["yes", "no"]:
-        await update.message.reply_text("Please reply with Yes or No.")
-        return RETURN_CONFIRM
-
-    if answer == "no":
-        context.user_data.pop("preferred_collection_datetime", None)
-        context.user_data.pop("pouch_quantity", None)
-        context.user_data.pop("pending_action", None)
-        return await show_main_menu(update, context, "Return request cancelled.")
-
-    user = update.effective_user
-    instagram_handle = context.user_data.get("instagram_handle") or get_saved_instagram(user.id) or ""
-    preferred_dt = context.user_data.get("preferred_collection_datetime", "").strip()
-    qty = int(context.user_data["pouch_quantity"])
-    code = make_code("RET")
-
-    store.create_packaging_return(
-        code=code,
-        telegram_user_id=user.id,
-        telegram_username=user.username or "",
-        instagram_handle=instagram_handle,
-        preferred_collection_datetime=preferred_dt,
-        pouch_quantity=qty,
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("Approve", callback_data=f"pr|a|{code}"),
-            InlineKeyboardButton("Reject", callback_data=f"pr|r|{code}"),
-        ]]
-    )
-
-    summary = (
-        "Packaging Return Request\n\n"
-        f"Request code: {code}\n"
-        f"Telegram user ID: {user.id}\n"
-    )
-
-    if user.username:
-        summary += f"Telegram username: @{user.username}\n"
-
-    summary += (
-        f"Instagram: @{instagram_handle}\n"
-        f"Preferred collection date/time: {preferred_dt}\n"
-        f"Embroidered pouches: {qty}\n"
-        f"Points requested: {qty}\n\n"
-        "Please arrange collection through Instagram/backend flow."
-    )
-
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=summary,
-        reply_markup=keyboard,
-    )
-
-    context.user_data.pop("preferred_collection_datetime", None)
-    context.user_data.pop("pouch_quantity", None)
-    context.user_data.pop("pending_action", None)
-
-    return await show_main_menu(
-        update,
-        context,
-        "Thank you. Your packaging return request has been submitted.\n\n"
-        f"Request code: {code}\n\n"
-        "WLJ will contact you on Instagram with the arranged collection details.\n\n"
-        "Please remember to snap a picture of the delivery person when they collect the packaging.\n\n"
-        "You’re back at the main menu.",
-    )
-
-
-async def checkpoints_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    instagram_handle = get_saved_instagram(update.effective_user.id)
-    if not instagram_handle:
-        return await ask_for_instagram(update, context, "checkpoints")
-    return await run_checkpoints(update, context, instagram_handle)
-
-
-async def run_checkpoints(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    instagram_handle: str,
-) -> int:
-    user = update.effective_user
-    synced = store.sync_purchase_points(user.id, instagram_handle)
-    balance = store.get_points_balance(user.id)
-    tier, points_6m = store.update_customer_tier(user.id)
-    recent = store.get_recent_ledger(user.id)
-
-    lines = [
-        f"Instagram: @{instagram_handle}",
-        f"Current usable points: {balance}",
-        f"Tier: {tier}",
-        f"Points earned in the last 6 months: {points_6m}",
-    ]
-
-    next_tier_info = get_next_tier(points_6m)
-    if next_tier_info:
-        next_tier, next_threshold = next_tier_info
-        progress_bar = make_progress_bar(points_6m, next_threshold)
-        points_needed = next_threshold - points_6m
-        lines.append("")
-        lines.append(f"Progress to {next_tier}:")
-        lines.append(f"{progress_bar} {points_6m} / {next_threshold}")
-        lines.append(f"You’re only {points_needed} points away from {next_tier} 💫")
-    else:
-        lines.append("")
-        lines.append("You are already at the highest tier: Glassy ✨")
-
-    if synced:
-        lines.append("")
-        lines.append(f"New purchase points synced just now: {synced}")
-
-    if recent:
-        lines.append("")
-        lines.append("Recent activity:")
-        for row in recent:
-            change = row.get("points_change", "0")
-            tx_type = row.get("type", "")
-            ref = row.get("reference_code", "")
-            lines.append(f"- {tx_type}: {change} points ({ref})")
-
-    lines.append("")
-    lines.append("Rewards:")
-    lines.append("- 50 points = $1 voucher")
-    lines.append("- 100 points = $3 voucher")
-    lines.append("- 500 points = $15 voucher")
-
-    return await show_main_menu(update, context, "\n".join(lines))
-
-
-async def redeemrewards_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    instagram_handle = get_saved_instagram(update.effective_user.id)
-    if not instagram_handle:
-        return await ask_for_instagram(update, context, "redeemrewards")
-    return await run_redeem_entry(update, context, instagram_handle)
-
-
-async def run_redeem_entry(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    instagram_handle: str,
-) -> int:
-    user = update.effective_user
-    store.sync_purchase_points(user.id, instagram_handle)
-    balance = store.get_points_balance(user.id)
-
-    eligible = [pts for pts in sorted(REWARD_OPTIONS.keys()) if balance >= pts]
-    if not eligible:
-        return await show_main_menu(
-            update,
-            context,
-            f"You currently have {balance} point(s), which is not enough for a reward yet."
-        )
-
-    keyboard = [
-        [InlineKeyboardButton(f"{pts} points = {REWARD_OPTIONS[pts]}", callback_data=f"redeem|{pts}")]
-        for pts in eligible
-    ]
-
-    await update.effective_message.reply_text(
-        "Choose the reward you want to redeem:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return MENU
-
-
-async def redeem_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        _, points_raw = query.data.split("|", 1)
-        points = int(points_raw)
-    except ValueError:
-        await query.edit_message_text("Invalid reward selection.")
-        return
-
-    if points not in REWARD_OPTIONS:
-        await query.edit_message_text("That reward option is not available.")
-        return
-
-    user = query.from_user
-    instagram_handle = get_saved_instagram(user.id) or ""
-
-    store.sync_purchase_points(user.id, instagram_handle)
-    balance = store.get_points_balance(user.id)
-
-    if balance < points:
-        await query.edit_message_text(
-            f"You currently have {balance} point(s), which is not enough for this reward."
-        )
-        return
-
-    reward_value = REWARD_OPTIONS[points]
-    code = make_code("RED")
-    issued_dt = now_dt()
-    expires_dt = issued_dt + timedelta(days=30)
-
-    new_balance = store.add_points(
-        telegram_user_id=user.id,
-        instagram_handle=instagram_handle,
-        points=-points,
-        tx_type="redemption",
-        reference_code=code,
-        notes=f"Voucher issued for {reward_value}. Valid until {expires_dt.date().isoformat()}",
-        expires_at="",
-        expired_flag="no",
-    )
-
-    store.create_redemption(
-        code=code,
-        telegram_user_id=user.id,
-        telegram_username=user.username or "",
-        instagram_handle=instagram_handle,
-        reward_points=points,
-        reward_value=reward_value,
-        issued_at=issued_dt.isoformat(),
-        expires_at=expires_dt.isoformat(),
-    )
-
-    admin_keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Mark Redeemed", callback_data=f"markredeemed|{code}")]]
-    )
-
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=(
-            "Reward Voucher Issued\n\n"
-            f"Redemption code: {code}\n"
-            f"Telegram user ID: {user.id}\n"
-            f"Instagram: @{instagram_handle}\n"
-            f"Reward: {reward_value}\n"
-            f"Points deducted: {points}\n"
-            f"Issued at: {issued_dt.date().isoformat()}\n"
-            f"Expires at: {expires_dt.date().isoformat()}"
-        ),
-        reply_markup=admin_keyboard,
-    )
-
-    await query.edit_message_text(
-        "Your voucher has been issued.\n\n"
-        f"Voucher code: {code}\n"
-        f"Reward: {reward_value}\n"
-        f"Points deducted: {points}\n"
-        f"Current balance: {new_balance}\n"
-        f"Valid until: {expires_dt.date().isoformat()}\n\n"
-        "Please keep this code safe.\n"
-        "Reply /redeemrewards to redeem more points."
-    )
-
-
-async def howitworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (
-        "How WLJ Rewards works:\n\n"
-        "- 1 embroidered pouch returned = 1 point\n"
-        "- Purchase points use tier multipliers:\n"
-        "  Bean = 1x\n"
-        "  Water = 1.5x\n"
-        "  Icy = 2x\n"
-        "  Glassy = 3x\n"
-        "- Packaging returns do not use multipliers\n"
-        "- Usable points expire after 6 months\n"
-        "- Tier is based on purchase points earned in the last 6 months\n"
-        "- For packaging returns, please submit your preferred date and time for the coming week\n"
-        "- WLJ will contact you on Instagram with collection details\n"
-        "- Please snap a picture of the delivery person when they collect the packaging. You may need this later for approval support\n"
-        "- Rewards are issued as unique voucher codes\n"
-        "- Voucher redemptions deduct points immediately\n"
-        "- Each voucher is valid for 30 days from the points exchange date\n"
-        "- Unused vouchers expire automatically after 30 days\n"
-        "- The bot sends reminder messages 7 days before expiry and 1 day before expiry\n"
-        "- Birthday voucher: $18 off any purchase, one-time use, expires in your birthday month, non-transferable"
-    )
-    return await show_main_menu(update, context, text)
-
-
-async def contactadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await show_main_menu(update, context, CONTACT_ADMIN_TEXT)
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    return await show_main_menu(update, context, "Action cancelled.")
-
-
-async def handle_packaging_admin_action(query, context, action: str, code: str) -> None:
-    request_row = store.get_packaging_return(code)
-    if not request_row:
-        await query.edit_message_text(f"Packaging return {code} not found.")
-        return
-
-    if str(request_row.get("status", "")).lower() != "pending":
-        await query.edit_message_text(f"Packaging return {code} is already processed.")
-        return
-
-    user_id = int(normalize_telegram_id(request_row["telegram_user_id"]))
-    instagram_handle = str(request_row.get("instagram_handle", ""))
-    qty = int(str(request_row.get("points_requested", "0") or "0"))
-
-    if action == "a":
-        expires_at = (now_dt() + timedelta(days=183)).isoformat()
-        new_balance = store.add_points(
-            telegram_user_id=user_id,
-            instagram_handle=instagram_handle,
-            points=qty,
-            tx_type="packaging_return",
-            reference_code=code,
-            notes=f"Approved packaging return for {qty} embroidered pouch(es)",
-            expires_at=expires_at,
-            expired_flag="no",
-        )
-        store.update_packaging_return(
-            code,
-            {
-                "status": "approved",
-                "admin_notes": "Approved in Telegram",
-                "approved_at": utc_now(),
-            },
-        )
-        await query.edit_message_text(f"Approved packaging return {code}. Added {qty} point(s).")
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"Your packaging return request {code} was approved.\n"
-                f"Points added: {qty}\n"
-                f"Current balance: {new_balance}"
-            ),
-        )
-        return
-
-    store.update_packaging_return(
-        code,
-        {
-            "status": "rejected",
-            "admin_notes": "Rejected in Telegram",
-        },
-    )
-    await query.edit_message_text(f"Rejected packaging return {code}.")
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=(
-            f"Your packaging return request {code} was rejected.\n"
-            "No points were added. Please contact WLJ admin if you need clarification."
-        ),
-    )
-
-
-async def mark_redeemed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        _, code = query.data.split("|", 1)
-    except ValueError:
-        await query.edit_message_text("Invalid redemption callback.")
-        return
-
-    redemption = store.get_redemption(code)
-    if not redemption:
-        await query.edit_message_text(f"Redemption {code} not found.")
-        return
-
-    status = str(redemption.get("redemption_status", "")).strip().lower()
-    if status == "redeemed":
-        await query.edit_message_text(f"{code} is already marked as redeemed.")
-        return
-    if status == "expired":
-        await query.edit_message_text(f"{code} has already expired.")
-        return
-    if status == "cancelled":
-        await query.edit_message_text(f"{code} has been cancelled.")
-        return
-
-    store.update_redemption(
-        code,
-        {
-            "redemption_status": "redeemed",
-            "redeemed_at": utc_now(),
-            "admin_notes": "Marked redeemed in Telegram.",
-        },
-    )
-
-    user_id = int(normalize_telegram_id(redemption["telegram_user_id"]))
-
-    await query.edit_message_text(f"{code} marked as redeemed.")
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=f"Your voucher {code} has been successfully used. Thank you!",
-    )
-
-
-async def mark_birthday_redeemed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        _, code = query.data.split("|", 1)
-    except ValueError:
-        await query.edit_message_text("Invalid birthday voucher callback.")
-        return
-
-    voucher = store.get_birthday_voucher(code)
-    if not voucher:
-        await query.edit_message_text(f"Birthday voucher {code} not found.")
-        return
-
-    status = str(voucher.get("status", "")).strip().lower()
-    if status == "redeemed":
-        await query.edit_message_text(f"{code} is already marked as redeemed.")
-        return
-    if status == "expired":
-        await query.edit_message_text(f"{code} has already expired.")
-        return
-
-    store.update_birthday_voucher(
-        code,
-        {
-            "status": "redeemed",
-            "redeemed_at": utc_now(),
-            "admin_notes": "Marked redeemed in Telegram.",
-        },
-    )
-
-    user_id = int(normalize_telegram_id(voucher["telegram_user_id"]))
-
-    await query.edit_message_text(f"{code} marked as redeemed.")
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=f"Your birthday voucher {code} has been successfully used. Happy birthday month from WLJ 🎉",
-    )
-
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    if data.startswith("pr|"):
-        try:
-            _, action, code = data.split("|", 2)
-        except ValueError:
-            await query.edit_message_text("Invalid callback payload.")
-            return
-        await handle_packaging_admin_action(query, context, action, code)
-        return
-
-    if data.startswith("markredeemed|"):
-        await mark_redeemed(update, context)
-        return
-
-    if data.startswith("markbirthdayredeemed|"):
-        await mark_birthday_redeemed(update, context)
-        return
-
-
-async def process_points_expiry(app: Application) -> None:
-    _, rows = store.read_sheet(LEDGER_SHEET)
-    now_time = now_dt()
+def get_multiplier(tier):
+    return {
+        "Bean": 1,
+        "Water": 1.5,
+        "Icy": 2,
+        "Glassy": 3
+    }[tier]
+
+def calculate_points(instagram):
+    headers, rows = get_sheet(PURCHASES_SHEET)
+
+    total_points = 0
+    last6m_points = 0
+
+    six_months_ago = datetime.datetime.utcnow() - datetime.timedelta(days=180)
 
     for row in rows:
-        tx_type = str(row.get("type", ""))
-        if tx_type not in ["purchase", "packaging_return"]:
+        if len(row) < 21:
             continue
 
-        expired_flag = str(row.get("expired_flag", "")).strip().lower()
-        if expired_flag == "yes":
+        handle = normalize_instagram(row[7])
+        points_awarded = row[19] if len(row) > 19 else ""
+        timestamp = row[20] if len(row) > 20 else ""
+
+        if handle != instagram:
+            continue
+
+        if points_awarded != "yes":
             continue
 
         try:
-            points_change = int(str(row.get("points_change", "0") or "0"))
-        except ValueError:
-            points_change = 0
-
-        if points_change <= 0:
+            dt = datetime.datetime.fromisoformat(timestamp)
+        except:
             continue
 
-        expires_at = parse_iso_datetime(str(row.get("expires_at", "")))
-        if not expires_at:
-            continue
+        amount = float(row[14])
 
-        if now_time < expires_at:
-            continue
+        # base points = amount
+        base_points = int(amount)
 
-        telegram_user_id = int(normalize_telegram_id(row.get("telegram_user_id", "")))
-        instagram_handle = str(row.get("instagram_handle", ""))
-        tx_id = str(row.get("transaction_id", ""))
-        expiry_ref = f"EXP-{tx_id}"
+        total_points += base_points
 
-        store.add_points(
-            telegram_user_id=telegram_user_id,
-            instagram_handle=instagram_handle,
-            points=-points_change,
-            tx_type="expiry",
-            reference_code=expiry_ref,
-            notes=f"Points expired from transaction {tx_id}",
-            expires_at="",
-            expired_flag="no",
+        if dt >= six_months_ago:
+            last6m_points += base_points
+
+    return total_points, last6m_points
+
+def build_progress_bar(current, target):
+    filled = int((current / target) * 10)
+    return "🟩" * filled + "⬜" * (10 - filled)
+
+# =========================
+# BOT HANDLERS
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    headers, customer, idx = find_customer(user.id)
+
+    if not customer:
+        create_customer(user)
+        await update.message.reply_text(
+            "Welcome to WLJ Rewards!\n\nPlease enter your Instagram handle (without @):"
         )
+        context.user_data["awaiting_handle"] = True
+        return
 
-        store.update_row_by_key(
-            LEDGER_SHEET,
-            "transaction_id",
-            tx_id,
-            {
-                "expired_flag": "yes",
-                "status": "expired",
-                "notes": f"{row.get('notes', '')} | Expired automatically after 6 months.",
-            },
+    # check missing fields
+    if not customer[2]:
+        await update.message.reply_text("Please enter your Instagram handle (without @):")
+        context.user_data["awaiting_handle"] = True
+        return
+
+    if not customer[3]:
+        await update.message.reply_text("Please enter your birthday (DD-MM-YYYY):")
+        context.user_data["awaiting_birthday"] = True
+        return
+
+    await update.message.reply_text("You're back at the main menu.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip()
+
+    headers, customer, idx = find_customer(user.id)
+
+    if context.user_data.get("awaiting_handle"):
+        handle = normalize_instagram(text)
+        update_cell(CUSTOMERS_SHEET, idx, 2, handle)
+
+        context.user_data["awaiting_handle"] = False
+        context.user_data["awaiting_birthday"] = True
+
+        await update.message.reply_text("Please enter your birthday (DD-MM-YYYY):")
+        return
+
+    if context.user_data.get("awaiting_birthday"):
+        update_cell(CUSTOMERS_SHEET, idx, 3, text)
+
+        context.user_data["awaiting_birthday"] = False
+
+        await update.message.reply_text("Registration complete 🎉")
+        return
+
+    # =========================
+    # CHECK POINTS
+    # =========================
+    if text.lower() in ["check points", "/checkpoints"]:
+        instagram = normalize_instagram(customer[2])
+
+        total, last6m = calculate_points(instagram)
+
+        tier = get_tier(last6m)
+
+        update_cell(CUSTOMERS_SHEET, idx, 4, total)
+        update_cell(CUSTOMERS_SHEET, idx, 5, tier)
+        update_cell(CUSTOMERS_SHEET, idx, 6, last6m)
+
+        target = {
+            "Bean": 1500,
+            "Water": 3000,
+            "Icy": 10000,
+            "Glassy": 10000
+        }[tier]
+
+        progress = build_progress_bar(last6m, target)
+
+        await update.message.reply_text(
+            f"""Instagram: @{instagram}
+Current usable points: {total}
+Tier: {tier}
+Points (last 6 months): {last6m}
+
+Progress:
+{progress} {last6m}/{target}
+
+You're {target - last6m} points away from next tier 🚀
+"""
         )
+        return
 
-        try:
-            await app.bot.send_message(
-                chat_id=telegram_user_id,
-                text=(
-                    f"{points_change} point(s) have expired from your WLJ Rewards account.\n"
-                    f"Current usable balance: {store.get_points_balance(telegram_user_id)}"
-                ),
-            )
-        except Exception as exc:
-            logger.warning("Could not send points expiry message: %s", exc)
+    # =========================
+    # CHANGE HANDLE
+    # =========================
+    if text.lower() in ["change handle", "/changehandle"]:
+        context.user_data["awaiting_handle"] = True
+        await update.message.reply_text("Enter your new Instagram handle:")
+        return
 
-        store.update_customer_tier(telegram_user_id)
+# =========================
+# RUN
+# =========================
 
+app = ApplicationBuilder().token(TOKEN).build()
 
-async def process_redemption_reminders_and_expiry(app: Application) -> None:
-    rows = store.get_all_redemptions()
-    now_time = now_dt()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    for row in rows:
-        code = str(row.get("redemption_code", ""))
-        if not code:
-            continue
-
-        status = str(row.get("redemption_status", "")).strip().lower()
-        expired_flag = str(row.get("expired_flag", "")).strip().lower()
-        redeemed_at = str(row.get("redeemed_at", "")).strip()
-
-        if status in ["redeemed", "cancelled", "expired"]:
-            continue
-        if redeemed_at:
-            continue
-
-        expires_at = parse_iso_datetime(str(row.get("expires_at", "")))
-        if not expires_at:
-            continue
-
-        user_id_raw = str(row.get("telegram_user_id", "")).strip()
-        if not user_id_raw:
-            continue
-
-        try:
-            user_id = int(normalize_telegram_id(user_id_raw))
-        except ValueError:
-            continue
-
-        reward_value = str(row.get("reward_value", ""))
-        expires_date = expires_at.date()
-        days_left = (expires_date - now_time.date()).days
-
-        if now_time >= expires_at and expired_flag != "yes":
-            store.update_redemption(
-                code,
-                {
-                    "redemption_status": "expired",
-                    "expired_flag": "yes",
-                    "admin_notes": "Expired automatically by bot.",
-                },
-            )
-            try:
-                await app.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"Your WLJ voucher {code} for {reward_value} has expired.\n"
-                        "Expired vouchers cannot be used."
-                    ),
-                )
-            except Exception as exc:
-                logger.warning("Failed to send redemption expiry message for %s: %s", code, exc)
-            continue
-
-        if days_left == 7 and str(row.get("reminder_sent_7d", "")).strip().lower() != "yes":
-            try:
-                await app.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        "Hi! 👋\n\n"
-                        f"Your WLJ voucher {code} for {reward_value} will expire in 7 days on {expires_date.isoformat()}.\n\n"
-                        "Please remember to use it before it expires.\n"
-                        "Reply /redeemrewards to redeem more points."
-                    ),
-                )
-                store.update_redemption(code, {"reminder_sent_7d": "yes"})
-            except Exception as exc:
-                logger.warning("Failed to send 7-day redemption reminder for %s: %s", code, exc)
-
-        if days_left == 1 and str(row.get("reminder_sent_1d", "")).strip().lower() != "yes":
-            try:
-                await app.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        "Reminder: your WLJ voucher is expiring soon.\n\n"
-                        f"Voucher code: {code}\n"
-                        f"Reward: {reward_value}\n"
-                        f"Expiry date: {expires_date.isoformat()}\n\n"
-                        "This voucher will expire in 1 day.\n"
-                        "Reply /redeemrewards to redeem more points."
-                    ),
-                )
-                store.update_redemption(code, {"reminder_sent_1d": "yes"})
-            except Exception as exc:
-                logger.warning("Failed to send 1-day redemption reminder for %s: %s", code, exc)
-
-
-async def process_birthday_vouchers(app: Application) -> None:
-    customers = store.get_all_customers()
-    vouchers = store.get_all_birthday_vouchers()
-    now_time = now_dt()
-    current_year = str(now_time.year)
-
-    for customer in customers:
-        birthday = str(customer.get("birthday", "")).strip()
-        if not birthday:
-            continue
-
-        try:
-            birth_dt = datetime.strptime(birthday, "%d-%m-%Y")
-        except ValueError:
-            continue
-
-        if birth_dt.month != now_time.month:
-            continue
-
-        telegram_user_id = int(normalize_telegram_id(customer.get("telegram_user_id", "")))
-        instagram_handle = str(customer.get("instagram_handle", ""))
-        telegram_username = str(customer.get("telegram_username", ""))
-
-        already_issued = False
-        for voucher in vouchers:
-            if (
-                normalize_telegram_id(voucher.get("telegram_user_id", "")) == str(telegram_user_id)
-                and str(voucher.get("year_issued", "")) == current_year
-            ):
-                already_issued = True
-                break
-
-        if already_issued:
-            continue
-
-        code = make_birthday_code()
-        issued_at = utc_now()
-        expires_at = end_of_birthday_month(now_time.year, now_time.month).isoformat()
-
-        store.create_birthday_voucher(
-            code=code,
-            telegram_user_id=telegram_user_id,
-            telegram_username=telegram_username,
-            instagram_handle=instagram_handle,
-            issued_at=issued_at,
-            expires_at=expires_at,
-            year_issued=current_year,
-        )
-
-        admin_keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Mark Redeemed", callback_data=f"markbirthdayredeemed|{code}")]]
-        )
-
-        try:
-            await app.bot.send_message(
-                chat_id=telegram_user_id,
-                text=(
-                    "Happy birthday month from WLJ 🎉\n\n"
-                    "You’ve received a one-time birthday voucher:\n"
-                    "$18 off any purchase\n\n"
-                    f"Code: {code}\n\n"
-                    "This voucher is non-transferable and expires at the end of your birthday month.\n"
-                    "Please show this code to WLJ when using it."
-                ),
-            )
-        except Exception as exc:
-            logger.warning("Failed to send birthday voucher to %s: %s", telegram_user_id, exc)
-
-        try:
-            await app.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=(
-                    "Birthday Voucher Issued\n\n"
-                    f"Code: {code}\n"
-                    f"Telegram user ID: {telegram_user_id}\n"
-                    f"Instagram: @{instagram_handle}\n"
-                    "Reward: $18 off any purchase\n"
-                    f"Expires at: {parse_iso_datetime(expires_at).date().isoformat()}"
-                ),
-                reply_markup=admin_keyboard,
-            )
-        except Exception as exc:
-            logger.warning("Failed to send birthday voucher admin message: %s", exc)
-
-async def process_birthday_voucher_reminders_and_expiry(app: Application) -> None:
-    rows = store.get_all_birthday_vouchers()
-    now_time = now_dt()
-
-    for row in rows:
-        code = str(row.get("birthday_code", ""))
-        status = str(row.get("status", "")).strip().lower()
-        redeemed_at = str(row.get("redeemed_at", "")).strip()
-
-        if status in ["redeemed", "expired", "cancelled"]:
-            continue
-        if redeemed_at:
-            continue
-
-        expires_at = parse_iso_datetime(str(row.get("expires_at", "")))
-        if not expires_at:
-            continue
-
-        user_id_raw = str(row.get("telegram_user_id", "")).strip()
-        if not user_id_raw:
-            continue
-
-        try:
-            user_id = int(normalize_telegram_id(user_id_raw))
-        except ValueError:
-            continue
-
-        expires_date = expires_at.date()
-        days_left = (expires_date - now_time.date()).days
-
-        if now_time >= expires_at:
-            store.update_birthday_voucher(
-                code,
-                {
-                    "status": "expired",
-                    "admin_notes": "Expired automatically by bot.",
-                },
-            )
-            try:
-                await app.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"Your birthday voucher {code} has expired.\n"
-                        "Expired birthday vouchers cannot be used."
-                    ),
-                )
-            except Exception as exc:
-                logger.warning("Failed to send birthday expiry message for %s: %s", code, exc)
-            continue
-
-        if days_left == 7 and str(row.get("reminder_sent_7d", "")).strip().lower() != "yes":
-            try:
-                await app.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        "Hi! 👋\n\n"
-                        f"Your birthday voucher {code} will expire in 7 days on {expires_date.isoformat()}.\n\n"
-                        "Please remember to use it before it expires."
-                    ),
-                )
-                store.update_birthday_voucher(code, {"reminder_sent_7d": "yes"})
-            except Exception as exc:
-                logger.warning("Failed to send 7-day birthday reminder for %s: %s", code, exc)
-
-        if days_left == 1 and str(row.get("reminder_sent_1d", "")).strip().lower() != "yes":
-            try:
-                await app.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        "Reminder: your birthday voucher is expiring soon.\n\n"
-                        f"Voucher code: {code}\n"
-                        f"Expiry date: {expires_date.isoformat()}\n\n"
-                        "This voucher will expire in 1 day."
-                    ),
-                )
-                store.update_birthday_voucher(code, {"reminder_sent_1d": "yes"})
-            except Exception as exc:
-                logger.warning("Failed to send 1-day birthday reminder for %s: %s", code, exc)
-
-
-async def process_scheduled_purchase_sync(app: Application) -> None:
-    customers = store.get_all_customers()
-
-    for customer in customers:
-        telegram_user_id_raw = str(customer.get("telegram_user_id", "")).strip()
-        instagram_handle = str(customer.get("instagram_handle", "")).strip()
-
-        if not telegram_user_id_raw or not instagram_handle:
-            continue
-
-        try:
-            telegram_user_id = int(normalize_telegram_id(telegram_user_id_raw))
-        except ValueError:
-            continue
-
-        try:
-            added = store.sync_purchase_points(telegram_user_id, instagram_handle)
-            if added > 0:
-                new_balance = store.get_points_balance(telegram_user_id)
-                try:
-                    await app.bot.send_message(
-                        chat_id=telegram_user_id,
-                        text=(
-                            f"Good news! {added} purchase point(s) have just been added to your WLJ Rewards account.\n"
-                            f"Current balance: {new_balance}"
-                        ),
-                    )
-                except Exception as exc:
-                    logger.warning("Could not send purchase sync message to user %s: %s", telegram_user_id, exc)
-        except Exception as exc:
-            logger.exception(
-                "Scheduled purchase sync failed for telegram_user_id=%s instagram=%s: %s",
-                telegram_user_id,
-                instagram_handle,
-                exc,
-            )
-
-
-async def daily_maintenance_loop(app: Application) -> None:
-    await app.wait_until_running()
-    while True:
-        try:
-            await process_points_expiry(app)
-            await process_redemption_reminders_and_expiry(app)
-            await process_birthday_vouchers(app)
-            await process_birthday_voucher_reminders_and_expiry(app)
-        except Exception as exc:
-            logger.exception("Daily maintenance loop error: %s", exc)
-        await asyncio.sleep(86400)
-
-
-async def purchase_sync_loop(app: Application) -> None:
-    await app.wait_until_running()
-    while True:
-        try:
-            await process_scheduled_purchase_sync(app)
-        except Exception as exc:
-            logger.exception("Purchase sync loop error: %s", exc)
-        await asyncio.sleep(3600)
-
-
-async def on_startup(app: Application) -> None:
-    app.create_task(daily_maintenance_loop(app))
-    app.create_task(purchase_sync_loop(app))
-    logger.info("Daily maintenance loop started.")
-    logger.info("Purchase sync loop started.")
-
-
-def main() -> None:
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(False)
-        .post_init(on_startup)
-        .build()
-    )
-
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("returnpackaging", returnpackaging_entry),
-            CommandHandler("checkpoints", checkpoints_entry),
-            CommandHandler("redeemrewards", redeemrewards_entry),
-            CommandHandler("howitworks", howitworks),
-            CommandHandler("contactadmin", contactadmin),
-            CommandHandler("changehandle", changehandle),
-        ],
-        states={
-            MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler)],
-            IG_CAPTURE: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_instagram)],
-            BIRTHDAY_CAPTURE: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_birthday)],
-            CHANGE_HANDLE_CAPTURE: [MessageHandler(filters.TEXT & ~filters.COMMAND, capture_changed_handle)],
-            RETURN_PREFERRED_DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, return_preferred_datetime)],
-            RETURN_POUCH_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, return_pouch_qty)],
-            RETURN_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, return_confirm)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("start", start),
-        ],
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(redeem_select, pattern=r"^redeem\|"))
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(pr\||markredeemed\||markbirthdayredeemed\|)"))
-
-    logger.info("WLJrewardsbot is running...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+app.run_polling()
