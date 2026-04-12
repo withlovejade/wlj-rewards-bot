@@ -472,7 +472,7 @@ def yes_no_markup() -> ReplyKeyboardMarkup:
 async def show_main_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    text: str = "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot.\n\nPlease choose an option.",
+    text: str = "Welcome to WLJ Rewards Bot.\n\nPlease choose an option.",
 ) -> int:
     await update.effective_message.reply_text(text, reply_markup=main_menu_markup())
     return MENU
@@ -515,7 +515,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await update.effective_message.reply_text(
         "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot. Nice to meet you!\n\n"
-        "For us to log your purchases backend, please enter your Instagram handle without the @ symbol. If you are a Tiktok user, you can fill in your Tiktok account username. Instagram handle is preferred.",
+        "For us to log your purchases backend, please enter your Instagram handle without the @ symbol. "
+        "If you are a Tiktok user, you can fill in your Tiktok account username. Instagram handle is preferred.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return IG_CAPTURE
@@ -557,9 +558,13 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     next_action = context.user_data.get("pending_action")
 
     if next_action == "returnpackaging":
+        context.user_data["instagram_handle"] = instagram_handle
         await update.message.reply_text(
-            "Please enter your preferred date and time for collection for the coming week.\n\n"
-            "Example: Tuesday 7pm, or 18 Apr 2026 2pm"
+            "Please enter your preferred collection date and time for the coming week.\n\n"
+            "Example:\n"
+            "Tuesday 7pm\n"
+            "or\n"
+            "18 Apr 2026, 2pm"
         )
         return RETURN_PREFERRED_DATETIME
 
@@ -578,12 +583,18 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def returnpackaging_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     instagram_handle = get_saved_instagram(update.effective_user.id)
+
     if not instagram_handle:
         return await ask_for_instagram(update, context, "returnpackaging")
 
+    context.user_data["instagram_handle"] = instagram_handle
+
     await update.effective_message.reply_text(
-        "Please enter your preferred date and time for collection for the coming week.\n\n"
-        "Example: Tuesday 7pm, or 18 Apr 2026 2pm",
+        "Please enter your preferred collection date and time for the coming week.\n\n"
+        "Example:\n"
+        "Tuesday 7pm\n"
+        "or\n"
+        "18 Apr 2026, 2pm",
         reply_markup=ReplyKeyboardRemove(),
     )
     return RETURN_PREFERRED_DATETIME
@@ -594,12 +605,15 @@ async def return_preferred_datetime(update: Update, context: ContextTypes.DEFAUL
 
     if not preferred_dt:
         await update.message.reply_text(
-            "Please enter your preferred date and time for collection."
+            "Please enter your preferred collection date and time."
         )
         return RETURN_PREFERRED_DATETIME
 
     context.user_data["preferred_collection_datetime"] = preferred_dt
-    await update.message.reply_text("How many embroidered pouches are you returning?")
+
+    await update.message.reply_text(
+        "How many embroidered pouches are you returning?"
+    )
     return RETURN_POUCH_QTY
 
 
@@ -650,24 +664,32 @@ async def return_pouch_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         qty = parse_int(update.message.text)
     except ValueError:
-        await update.message.reply_text("Please enter a whole number, such as 1, 2, or 5.")
+        await update.message.reply_text(
+            "Please enter a whole number, such as 1, 2, or 5."
+        )
         return RETURN_POUCH_QTY
 
     if qty <= 0:
-        await update.message.reply_text("Please enter a number greater than 0.")
+        await update.message.reply_text(
+            "Please enter a number greater than 0."
+        )
         return RETURN_POUCH_QTY
 
     context.user_data["pouch_quantity"] = qty
+
+    instagram_handle = context.user_data.get("instagram_handle", "")
     preferred_dt = context.user_data.get("preferred_collection_datetime", "")
 
     await update.message.reply_text(
-        f"Please confirm your packaging return request:\n\n"
-        f"Preferred date and time: {preferred_dt}\n"
-        f"Embroidered pouches: {qty}\n"
+        "Please review your request:\n\n"
+        f"Instagram handle: @{instagram_handle}\n"
+        f"Preferred collection date and time: {preferred_dt}\n"
+        f"Number of embroidered pouches: {qty}\n"
         f"Points to be requested after approval: {qty}\n\n"
-        "WLJ will contact you on Instagram with the arranged collection details.\n"
-        "Please remember to snap a picture of the delivery person collecting the packaging when they arrive to pick it up from you! "
-        "You will need this later when submitting for approval.\n\n"
+        "WLJ will contact you on Instagram with the arranged collection details.\n\n"
+        "Important:\n"
+        "Please snap a picture of the delivery person when they come to collect the packaging. "
+        "You may need this later for approval support.\n\n"
         "Reply Yes to submit or No to cancel.",
         reply_markup=yes_no_markup(),
     )
@@ -676,17 +698,20 @@ async def return_pouch_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     answer = update.message.text.strip().lower()
+
     if answer not in ["yes", "no"]:
         await update.message.reply_text("Please reply with Yes or No.")
         return RETURN_CONFIRM
 
     if answer == "no":
+        context.user_data.pop("preferred_collection_datetime", None)
+        context.user_data.pop("pouch_quantity", None)
         return await show_main_menu(update, context, "Return request cancelled.")
 
     user = update.effective_user
-    instagram_handle = get_saved_instagram(user.id) or ""
-    qty = int(context.user_data["pouch_quantity"])
+    instagram_handle = context.user_data.get("instagram_handle") or get_saved_instagram(user.id) or ""
     preferred_dt = context.user_data.get("preferred_collection_datetime", "").strip()
+    qty = int(context.user_data["pouch_quantity"])
     code = make_code("RET")
 
     store.create_packaging_return(
@@ -710,15 +735,16 @@ async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Request code: {code}\n"
         f"Telegram user ID: {user.id}\n"
     )
+
     if user.username:
         summary += f"Telegram username: @{user.username}\n"
 
     summary += (
         f"Instagram: @{instagram_handle}\n"
-        f"Please state your preferred collection date/time for the following week: {preferred_dt}\n"
+        f"Preferred collection date/time: {preferred_dt}\n"
         f"Embroidered pouches: {qty}\n"
         f"Points requested: {qty}\n\n"
-        "Please arrange collection through Instagram backend."
+        "Please arrange collection through Instagram/backend flow."
     )
 
     await context.bot.send_message(
@@ -727,12 +753,15 @@ async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_markup=keyboard,
     )
 
+    context.user_data.pop("preferred_collection_datetime", None)
+    context.user_data.pop("pouch_quantity", None)
+
     return await show_main_menu(
         update,
         context,
-        "Your packaging return request has been submitted.\n\n"
+        "Thank you. Your packaging return request has been submitted.\n\n"
         f"Request code: {code}\n\n"
-        "WLJ will contact you on Instagram/Tiktok with the arranged collection details.\n"
+        "WLJ will contact you on Instagram with the arranged collection details.\n\n"
         "Please remember to snap a picture of the delivery person when they collect the packaging.\n\n"
         "You’re back at the main menu.",
     )
@@ -796,7 +825,7 @@ async def redeem_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if balance < points:
         await query.edit_message_text(
-            f"You currently have {balance} point(s), which is not enough for this reward. Don't be sad! You can slowly collect more points!"
+            f"You currently have {balance} point(s), which is not enough for this reward."
         )
         return
 
@@ -851,7 +880,7 @@ async def redeem_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Points deducted: {points}\n"
         f"Current balance: {new_balance}\n"
         f"Valid until: {expires_dt.date().isoformat()}\n\n"
-        "Please keep this code safe as you will need to send this to the admin team on Instagram to offset your payment.\n"
+        "Please keep this code safe.\n"
         "Reply /redeemrewards to redeem more points."
     )
 
@@ -923,8 +952,8 @@ async def handle_packaging_admin_action(query, context, action: str, code: str) 
     await context.bot.send_message(
         chat_id=user_id,
         text=(
-            f"Unfortunately, your packaging return request {code} was rejected likely because of a technical issue.\n"
-            "No points were added. Please contact WLJ admin if you need clarification and assistance!"
+            f"Your packaging return request {code} was rejected.\n"
+            "No points were added. Please contact WLJ admin if you need clarification."
         ),
     )
 
@@ -1147,7 +1176,6 @@ async def howitworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "- Each voucher is valid for 30 days from the points exchange date\n\n"
         "- Unused vouchers expire automatically after 30 days\n\n"
         "- The bot sends reminder messages 7 days before expiry and 1 day before expiry"
-      
     )
     return await show_main_menu(update, context, "You’re back at the main menu.")
 
