@@ -1138,7 +1138,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-git add requirements.txt
-git commit -m "Add Google Sheets dependencies"
-git push
