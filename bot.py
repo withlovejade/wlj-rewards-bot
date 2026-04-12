@@ -93,12 +93,17 @@ def parse_int(value: str) -> int:
 
 
 def parse_amount_to_points(value: str) -> int:
+    raw = str(value).strip()
+    raw = raw.replace("$", "").replace(",", "").replace("SGD", "").strip()
+
     try:
-        amount = Decimal(str(value).strip())
+        amount = Decimal(raw)
     except InvalidOperation:
         return 0
+
     if amount < 0:
         return 0
+
     return int(amount)
 
 
@@ -128,14 +133,15 @@ class SheetsStore:
 
     def read_sheet(self, sheet_name: str) -> Tuple[List[str], List[Dict[str, str]]]:
         result = (
-            self.service.spreadsheets()
-            .values()
-            .get(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"{sheet_name}!A:Z",
-            )
-            .execute()
-        )
+    self.service.spreadsheets()
+    .values()
+    .get(
+        spreadsheetId=self.spreadsheet_id,
+        range=f"{sheet_name}!A:Z",
+        valueRenderOption="UNFORMATTED_VALUE",
+    )
+    .execute()
+)
         values = result.get("values", [])
         if not values:
             return [], []
@@ -332,16 +338,14 @@ class SheetsStore:
             points = parse_amount_to_points(row.get("amount_paid", "0"))
             if points <= 0:
                 self.update_row_by_key(
-                    PURCHASES_SHEET,
-                    "purchase_id",
-                    purchase_id,
-                    {
-                        "points_awarded": "yes",
-                        "points_awarded_at": utc_now(),
-                        "notes": "No points awarded because amount was invalid or zero.",
-                    },
-                )
-                continue
+                PURCHASES_SHEET,
+                "purchase_id",
+                purchase_id,
+            {
+            "notes": "Points not synced because amount_paid was invalid or zero.",
+        },
+    )
+    continue
 
             self.add_points(
                 telegram_user_id=telegram_user_id,
