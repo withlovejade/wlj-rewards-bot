@@ -465,13 +465,23 @@ def yes_no_markup() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([["Yes", "No"]], resize_keyboard=True, one_time_keyboard=True)
 
 
-async def show_main_menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str = "Welcome to WLJ Rewards Bot.\n\nPlease choose an option.",
-) -> int:
-    await update.effective_message.reply_text(text, reply_markup=main_menu_markup())
-    return MENU
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+
+    saved_instagram = get_saved_instagram(update.effective_user.id)
+    if saved_instagram:
+        return await show_main_menu(
+            update,
+            context,
+            f"Welcome back! Your saved Instagram handle is @{saved_instagram}.\n\nPlease choose an option.",
+        )
+
+    await update.effective_message.reply_text(
+        "Welcome to WLJ Rewards Bot.\n\n"
+        "Please enter your Instagram handle without the @ symbol.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return IG_CAPTURE
 
 
 def ensure_instagram_prompt(context: ContextTypes.DEFAULT_TYPE, next_action: str) -> None:
@@ -492,8 +502,8 @@ async def ask_for_instagram(
 ) -> int:
     ensure_instagram_prompt(context, next_action)
     await update.effective_message.reply_text(
-        "Please enter your Instagram handle.\n"
-        "We use this to match your WLJ purchases and contact records.",
+        "For us to better track your current reward points, plase enter your Instagram handle.\n"
+        "Please do not worry, we use this information only to match your WLJ purchases and contact records.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return IG_CAPTURE
@@ -525,6 +535,12 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     instagram_handle = normalize_instagram(update.message.text)
     user = update.effective_user
 
+    if not instagram_handle:
+        await update.message.reply_text(
+            "Please enter your Instagram handle without the @ symbol."
+        )
+        return IG_CAPTURE
+
     store.upsert_customer(
         telegram_user_id=user.id,
         telegram_username=user.username or "",
@@ -543,8 +559,11 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if next_action == "redeemrewards":
         return await run_redeem_entry(update, context, instagram_handle)
 
-    return await show_main_menu(update, context)
-
+    return await show_main_menu(
+        update,
+        context,
+        f"Thank you! Your Instagram handle has been saved as @{instagram_handle}.\n\nPlease choose an option.",
+    )
 
 async def returnpackaging_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     instagram_handle = get_saved_instagram(update.effective_user.id)
