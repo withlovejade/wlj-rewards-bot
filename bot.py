@@ -37,7 +37,10 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 import base64
-GOOGLE_SERVICE_ACCOUNT_JSON = base64.b64decode(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON_B64"]).decode("utf-8")
+
+GOOGLE_SERVICE_ACCOUNT_JSON = base64.b64decode(
+    os.environ["GOOGLE_SERVICE_ACCOUNT_JSON_B64"]
+).decode("utf-8")
 CONTACT_ADMIN_TEXT = os.environ.get(
     "CONTACT_ADMIN_TEXT",
     "Please contact WLJ admin through your usual WLJ contact channel.",
