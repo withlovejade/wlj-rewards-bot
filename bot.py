@@ -1611,6 +1611,67 @@ def expire_old_birthday_vouchers() -> None:
 # DAILY JOB RUNNER
 # =========================
 
+async def run_birthday_voucher_job(context: ContextTypes.DEFAULT_TYPE):
+    customers = store.get_all_customers()
+    vouchers = store.get_all_birthday_vouchers()
+
+    today = datetime.now(timezone.utc)
+    today_str = today.strftime("%d-%m")
+    year = today.strftime("%Y")
+
+    for customer in customers:
+        user_id = str(customer.get("telegram_user_id", "")).strip()
+        birthday = str(customer.get("birthday", "")).strip()
+        instagram = str(customer.get("instagram_handle", "")).strip()
+        username = str(customer.get("telegram_username", "")).strip()
+
+        if not user_id or not birthday or not instagram:
+            continue
+
+        try:
+            bday = datetime.strptime(birthday, "%d-%m-%Y")
+        except ValueError:
+            continue
+
+        if bday.strftime("%d-%m") != today_str:
+            continue
+
+        already_issued = any(
+            str(v.get("telegram_user_id")) == user_id
+            and str(v.get("year_issued")) == year
+            for v in vouchers
+        )
+
+        if already_issued:
+            continue
+
+        code = make_birthday_code()
+        expires_at = end_of_birthday_month(today.year, today.month).isoformat()
+
+        store.create_birthday_voucher(
+            code=code,
+            telegram_user_id=int(user_id),
+            telegram_username=username,
+            instagram_handle=instagram,
+            issued_at=utc_now(),
+            expires_at=expires_at,
+            year_issued=year,
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=(
+                    "🎉 Happy Birthday from WLJ! 🎉\n\n"
+                    f"🎟 Voucher Code: {code}\n"
+                    "💰 $18 off any purchase\n\n"
+                    "Valid until end of this month 💖"
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Failed to send birthday message: {e}")
+
+
 async def daily_jobs(context: ContextTypes.DEFAULT_TYPE):
     try:
         await run_birthday_voucher_job(context)
