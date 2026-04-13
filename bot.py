@@ -309,12 +309,12 @@ class SheetsStore:
         )
 
     def upsert_customer(
-    self,
-    telegram_user_id: int,
-    telegram_username: str,
-    instagram_handle: str,
-) -> None:
-    existing = self.get_customer_by_telegram_id(telegram_user_id)
+        self,
+        telegram_user_id: int,
+        telegram_username: str,
+        instagram_handle: str,
+    ) -> None:
+        existing = self.get_customer_by_telegram_id(telegram_user_id)
 
     if existing:
         self.update_customer_fields(
@@ -325,6 +325,24 @@ class SheetsStore:
                 "last_activity_at": utc_now(),
             },
         )
+        return
+
+    self.append_row(
+        CUSTOMERS_SHEET,
+        [
+            str(telegram_user_id),
+            telegram_username or "",
+            instagram_handle,
+            "",
+            "0",
+            "Bean",
+            "0",
+            utc_now(),
+            utc_now(),
+            "",
+            "",
+        ],
+    )
         return
 
     # ONLY create new if truly does not exist
