@@ -4,7 +4,6 @@ import base64
 import json
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
 
 from google.oauth2.service_account import Credentials
@@ -66,13 +65,6 @@ def parse_birthday_ddmmyyyy(value: str) -> Optional[str]:
         return datetime.strptime(str(value).strip(), "%d-%m-%Y").strftime("%d-%m-%Y")
     except ValueError:
         return None
-
-
-def parse_int_safe(value) -> int:
-    try:
-        return int(str(value).strip())
-    except Exception:
-        return 0
 
 
 class SheetsStore:
@@ -175,37 +167,18 @@ class SheetsStore:
         ]
         if not matches:
             return None
+        return matches[-1]
 
-        best = matches[-1]
-        for row in reversed(matches):
-            has_ig = str(row.get("instagram_handle", "")).strip()
-            has_bday = str(row.get("birthday", "")).strip()
-            if has_ig or has_bday:
-                best = row
-                break
-        return best
-
-    def upsert_customer(self, telegram_user_id: int, telegram_username: str, instagram_handle: str) -> None:
+    def ensure_customer_exists(self, telegram_user_id: int, telegram_username: str = "") -> None:
         existing = self.get_customer_by_telegram_id(telegram_user_id)
         if existing:
-            self.update_latest_row_by_key(
-                CUSTOMERS_SHEET,
-                "telegram_user_id",
-                str(telegram_user_id),
-                {
-                    "telegram_username": telegram_username or "",
-                    "instagram_handle": instagram_handle,
-                    "last_activity_at": utc_now(),
-                },
-            )
             return
-
         self.append_row(
             CUSTOMERS_SHEET,
             [
                 str(telegram_user_id),
                 telegram_username or "",
-                instagram_handle,
+                "",
                 "",
                 "0",
                 "Bean",
@@ -217,25 +190,45 @@ class SheetsStore:
             ],
         )
 
-    def update_customer_fields(self, telegram_user_id: int, updates: Dict[str, str]) -> None:
+    def upsert_instagram(self, telegram_user_id: int, telegram_username: str, instagram_handle: str) -> None:
+        self.ensure_customer_exists(telegram_user_id, telegram_username)
         self.update_latest_row_by_key(
             CUSTOMERS_SHEET,
             "telegram_user_id",
             str(telegram_user_id),
-            updates,
+            {
+                "telegram_username": telegram_username or "",
+                "instagram_handle": instagram_handle,
+                "last_activity_at": utc_now(),
+            },
+        )
+
+    def upsert_birthday(self, telegram_user_id: int, telegram_username: str, birthday: str) -> None:
+        self.ensure_customer_exists(telegram_user_id, telegram_username)
+        self.update_latest_row_by_key(
+            CUSTOMERS_SHEET,
+            "telegram_user_id",
+            str(telegram_user_id),
+            {
+                "telegram_username": telegram_username or "",
+                "birthday": birthday,
+                "last_activity_at": utc_now(),
+            },
         )
 
     def get_points_balance(self, telegram_user_id: int) -> int:
         target = normalize_telegram_id(telegram_user_id)
         _, rows = self.read_sheet(LEDGER_SHEET)
         total = 0
+
         for row in rows:
             if normalize_telegram_id(row.get("telegram_user_id", "")) != target:
                 continue
             try:
-                total += parse_int_safe(row.get("points_change", "0"))
-            except Exception:
-                pass
+                total += int(str(row.get("points_change", "0") or "0"))
+            except ValueError:
+                continue
+
         return max(total, 0)
 
 
@@ -268,6 +261,7 @@ async def show_main_menu(update: Update, text: str = "Please choose an option.")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     user = update.effective_user
+    store.ensure_customer_exists(user.id, user.username or "")
 
     saved_instagram = get_saved_instagram(user.id)
     saved_birthday = get_saved_birthday(user.id)
@@ -278,21 +272,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"Welcome back! Your saved Instagram handle is @{saved_instagram}.\n\nPlease choose an option.",
         )
 
-    if saved_instagram and not saved_birthday:
-        context.user_data["instagram_handle"] = saved_instagram
+    if not saved_instagram:
         await update.effective_message.reply_text(
-            "Please enter your birthday in DD-MM-YYYY format.\n\nExample:\n14-09-1996",
+            "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot.\n\n"
+            "Please enter your Instagram handle without the @ symbol. "
+            "If you are a Tiktok user, you can fill in your Tiktok username. Instagram is preferred.",
             reply_markup=ReplyKeyboardRemove(),
         )
-        return BIRTHDAY_CAPTURE
+        return IG_CAPTURE
 
     await update.effective_message.reply_text(
-        "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot.\n\n"
-        "Please enter your Instagram handle without the @ symbol. "
-        "If you are a Tiktok user, you can fill in your Tiktok username. Instagram is preferred.",
+        "Please enter your birthday in DD-MM-YYYY format.\n\nExample:\n14-09-1996",
         reply_markup=ReplyKeyboardRemove(),
     )
-    return IG_CAPTURE
+    return BIRTHDAY_CAPTURE
 
 
 async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -303,24 +296,19 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Please enter your Instagram handle without the @ symbol.")
         return IG_CAPTURE
 
-    store.upsert_customer(
-        telegram_user_id=user.id,
-        telegram_username=user.username or "",
-        instagram_handle=instagram_handle,
-    )
-    context.user_data["instagram_handle"] = instagram_handle
+    store.upsert_instagram(user.id, user.username or "", instagram_handle)
 
     saved_birthday = get_saved_birthday(user.id)
-    if not saved_birthday:
-        await update.message.reply_text(
-            "Please enter your birthday in DD-MM-YYYY format.\n\nExample:\n14-09-1996"
+    if saved_birthday:
+        return await show_main_menu(
+            update,
+            f"Thanks! Your Instagram handle has been saved as @{instagram_handle}.\n\nPlease choose an option.",
         )
-        return BIRTHDAY_CAPTURE
 
-    return await show_main_menu(
-        update,
-        f"Thanks! Your Instagram handle has been saved as @{instagram_handle}.\n\nPlease choose an option.",
+    await update.message.reply_text(
+        "Please enter your birthday in DD-MM-YYYY format.\n\nExample:\n14-09-1996"
     )
+    return BIRTHDAY_CAPTURE
 
 
 async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -332,36 +320,7 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return BIRTHDAY_CAPTURE
 
     user = update.effective_user
-    instagram_handle = context.user_data.get("instagram_handle") or get_saved_instagram(user.id)
-
-    if not instagram_handle:
-        await update.message.reply_text(
-            "Please enter your Instagram handle without the @ symbol.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return IG_CAPTURE
-
-    existing = store.get_customer_by_telegram_id(user.id)
-    if existing:
-        store.update_customer_fields(
-            user.id,
-            {
-                "instagram_handle": instagram_handle,
-                "birthday": birthday,
-                "last_activity_at": utc_now(),
-            },
-        )
-    else:
-        store.upsert_customer(user.id, user.username or "", instagram_handle)
-        store.update_customer_fields(
-            user.id,
-            {
-                "birthday": birthday,
-                "last_activity_at": utc_now(),
-            },
-        )
-
-    context.user_data["instagram_handle"] = instagram_handle
+    store.upsert_birthday(user.id, user.username or "", birthday)
     return await show_main_menu(update, "Thanks! Your birthday has been saved.\n\nPlease choose an option.")
 
 
@@ -379,42 +338,26 @@ async def capture_changed_handle(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Please enter a valid Instagram handle without @.")
         return CHANGE_HANDLE_CAPTURE
 
-    store.update_customer_fields(
-        update.effective_user.id,
-        {
-            "instagram_handle": new_handle,
-            "last_activity_at": utc_now(),
-        },
-    )
-    context.user_data["instagram_handle"] = new_handle
+    user = update.effective_user
+    store.upsert_instagram(user.id, user.username or "", new_handle)
     return await show_main_menu(update, f"Your handle has been updated to @{new_handle}")
 
 
 async def checkpoints_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    instagram_handle = get_saved_instagram(user_id)
-    birthday = get_saved_birthday(user_id)
+    user = update.effective_user
+    store.ensure_customer_exists(user.id, user.username or "")
+    balance = store.get_points_balance(user.id)
 
-    if not instagram_handle:
-        await update.effective_message.reply_text(
-            "Please enter your Instagram handle without the @ symbol.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return IG_CAPTURE
+    customer = store.get_customer_by_telegram_id(user.id)
+    instagram_handle = ""
+    if customer:
+        instagram_handle = str(customer.get("instagram_handle", "")).strip()
 
-    if not birthday:
-        context.user_data["instagram_handle"] = instagram_handle
-        await update.effective_message.reply_text(
-            "Please enter your birthday in DD-MM-YYYY format.\n\nExample:\n14-09-1996",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return BIRTHDAY_CAPTURE
+    text = f"Current usable points: {balance}"
+    if instagram_handle:
+        text = f"Instagram: @{instagram_handle}\n" + text
 
-    balance = store.get_points_balance(user_id)
-    return await show_main_menu(
-        update,
-        f"Instagram: @{instagram_handle}\nCurrent usable points: {balance}",
-    )
+    return await show_main_menu(update, text)
 
 
 async def howitworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -440,8 +383,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return await howitworks(update, context)
     if choice == "Change Handle":
         return await changehandle(update, context)
-    if choice == "Redeem Rewards":
-        return await show_main_menu(update, "Redeem Rewards will be added after we stabilize the loop.")
 
     return await show_main_menu(update, "Please choose one of the menu options.")
 
@@ -470,7 +411,7 @@ def main() -> None:
     )
 
     app.add_handler(conv_handler)
-    logger.info("WLJ simplified bot is running...")
+    logger.info("WLJ no-loop checkpoints bot is running...")
     app.run_polling()
 
 
