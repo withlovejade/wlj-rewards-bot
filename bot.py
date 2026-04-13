@@ -1627,6 +1627,27 @@ async def daily_jobs(context: ContextTypes.DEFAULT_TYPE):
 # MAIN / HANDLERS
 # =========================
 
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data.startswith("pr|"):
+        try:
+            _, action, code = data.split("|", 2)
+        except ValueError:
+            await query.edit_message_text("Invalid callback payload.")
+            return
+
+        await handle_packaging_admin_action(query, context, action, code)
+        return
+
+    if data.startswith("redeem|"):
+        await redeem_select(update, context)
+        return
+
+
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
