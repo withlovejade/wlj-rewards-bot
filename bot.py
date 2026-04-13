@@ -702,7 +702,7 @@ class SheetsStore:
                 "",                      # extra field (safety)
             ],
         )
-        def get_all_birthday_vouchers(self) -> List[Dict[str, str]]:
+    def get_all_birthday_vouchers(self) -> List[Dict[str, str]]:
         _, rows = self.read_sheet(BIRTHDAY_VOUCHERS_SHEET)
         return rows
 
