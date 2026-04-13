@@ -70,6 +70,7 @@ TIER_THRESHOLDS = {
     "Glassy": 10000,
 }
 TIER_ORDER = ["Bean", "Water", "Icy", "Glassy"]
+
 PURCHASE_MULTIPLIERS = {
     "Bean": Decimal("1.0"),
     "Water": Decimal("1.5"),
@@ -239,7 +240,18 @@ class SheetsStore:
             .execute()
         )
 
-    def update_row_by_key(
+    def _matching_row_indexes(self, sheet_name: str, key_column: str, key_value: str) -> List[int]:
+        _, rows = self.read_sheet(sheet_name)
+        target = normalize_telegram_id(key_value) if key_column == "telegram_user_id" else str(key_value)
+        indexes = []
+        for row_index, row in enumerate(rows, start=2):
+            current = row.get(key_column, "")
+            current = normalize_telegram_id(current) if key_column == "telegram_user_id" else str(current)
+            if current == target:
+                indexes.append(row_index)
+        return indexes
+
+    def update_latest_row_by_key(
         self,
         sheet_name: str,
         key_column: str,
@@ -251,30 +263,38 @@ class SheetsStore:
             return False
 
         target = normalize_telegram_id(key_value) if key_column == "telegram_user_id" else str(key_value)
+        target_row_index = None
+        target_row = None
 
         for row_index, row in enumerate(rows, start=2):
             current = row.get(key_column, "")
             current = normalize_telegram_id(current) if key_column == "telegram_user_id" else str(current)
             if current == target:
-                new_row = [row.get(header, "") for header in headers]
-                for col_name, new_value in updates.items():
-                    if col_name in headers:
-                        idx = headers.index(col_name)
-                        new_row[idx] = str(new_value)
-                body = {"values": [new_row]}
-                (
-                    self.service.spreadsheets()
-                    .values()
-                    .update(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f"{sheet_name}!A{row_index}:AZ{row_index}",
-                        valueInputOption="USER_ENTERED",
-                        body=body,
-                    )
-                    .execute()
-                )
-                return True
-        return False
+                target_row_index = row_index
+                target_row = row
+
+        if target_row_index is None or target_row is None:
+            return False
+
+        new_row = [target_row.get(header, "") for header in headers]
+        for col_name, new_value in updates.items():
+            if col_name in headers:
+                idx = headers.index(col_name)
+                new_row[idx] = str(new_value)
+
+        body = {"values": [new_row]}
+        (
+            self.service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{sheet_name}!A{target_row_index}:AZ{target_row_index}",
+                valueInputOption="USER_ENTERED",
+                body=body,
+            )
+            .execute()
+        )
+        return True
 
     def get_customer_by_telegram_id(self, telegram_user_id: int) -> Optional[Dict[str, str]]:
         target = normalize_telegram_id(telegram_user_id)
@@ -285,14 +305,20 @@ class SheetsStore:
         ]
         if not matches:
             return None
-        return matches[-1]
+
+        best = matches[-1]
+        for row in reversed(matches):
+            if str(row.get("instagram_handle", "")).strip() or str(row.get("birthday", "")).strip():
+                best = row
+                break
+        return best
 
     def get_all_customers(self) -> List[Dict[str, str]]:
         _, rows = self.read_sheet(CUSTOMERS_SHEET)
         return rows
 
     def update_customer_fields(self, telegram_user_id: int, updates: Dict[str, str]) -> None:
-        self.update_row_by_key(
+        self.update_latest_row_by_key(
             CUSTOMERS_SHEET,
             "telegram_user_id",
             str(telegram_user_id),
@@ -337,7 +363,6 @@ class SheetsStore:
     def get_points_balance(self, telegram_user_id: int) -> int:
         target = normalize_telegram_id(telegram_user_id)
         _, rows = self.read_sheet(LEDGER_SHEET)
-
         total = 0
         now = now_dt()
 
@@ -381,9 +406,7 @@ class SheetsStore:
     def set_customer_last_synced_at(self, telegram_user_id: int, synced_at: str) -> None:
         self.update_customer_fields(
             telegram_user_id,
-            {
-                "last_synced_at": synced_at,
-            },
+            {"last_synced_at": synced_at},
         )
 
     def add_ledger_entry(
@@ -532,7 +555,7 @@ class SheetsStore:
                 expired_flag="no",
             )
 
-            self.update_row_by_key(
+            self.update_latest_row_by_key(
                 PURCHASES_SHEET,
                 "purchase_id",
                 purchase_id,
@@ -583,7 +606,7 @@ class SheetsStore:
         return None
 
     def update_packaging_return(self, code: str, updates: Dict[str, str]) -> bool:
-        return self.update_row_by_key(
+        return self.update_latest_row_by_key(
             PACKAGING_RETURNS_SHEET,
             "return_request_code",
             code,
@@ -621,25 +644,6 @@ class SheetsStore:
             ],
         )
 
-    def get_redemption(self, code: str) -> Optional[Dict[str, str]]:
-        _, rows = self.read_sheet(REDEMPTIONS_SHEET)
-        for row in rows:
-            if str(row.get("redemption_code", "")) == str(code):
-                return row
-        return None
-
-    def update_redemption(self, code: str, updates: Dict[str, str]) -> bool:
-        return self.update_row_by_key(
-            REDEMPTIONS_SHEET,
-            "redemption_code",
-            code,
-            updates,
-        )
-
-    def get_all_redemptions(self) -> List[Dict[str, str]]:
-        _, rows = self.read_sheet(REDEMPTIONS_SHEET)
-        return rows
-
     def create_birthday_voucher(
         self,
         code: str,
@@ -673,7 +677,7 @@ class SheetsStore:
         return rows
 
     def update_birthday_voucher(self, code: str, updates: Dict[str, str]) -> bool:
-        return self.update_row_by_key(
+        return self.update_latest_row_by_key(
             BIRTHDAY_VOUCHERS_SHEET,
             "birthday_code",
             code,
@@ -719,11 +723,7 @@ def get_saved_birthday(user_id: int) -> Optional[str]:
     return None
 
 
-async def ask_for_instagram(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    next_action: str,
-) -> int:
+async def ask_for_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE, next_action: str) -> int:
     set_pending_action(context, next_action)
     await update.effective_message.reply_text(
         "Please enter your Instagram handle without the @ symbol.",
@@ -732,16 +732,10 @@ async def ask_for_instagram(
     return IG_CAPTURE
 
 
-async def ask_for_birthday(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    next_action: str,
-) -> int:
+async def ask_for_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE, next_action: str) -> int:
     set_pending_action(context, next_action)
     await update.effective_message.reply_text(
-        "Please enter your birthday in DD-MM-YYYY format.\n\n"
-        "Example:\n"
-        "14-09-1996",
+        "Please enter your birthday in DD-MM-YYYY format.\n\nExample:\n14-09-1996",
         reply_markup=ReplyKeyboardRemove(),
     )
     return BIRTHDAY_CAPTURE
@@ -749,7 +743,6 @@ async def ask_for_birthday(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-
     customer = store.get_customer_by_telegram_id(update.effective_user.id)
     saved_instagram = str(customer.get("instagram_handle", "")).strip() if customer else ""
     saved_birthday = str(customer.get("birthday", "")).strip() if customer else ""
@@ -767,8 +760,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await update.effective_message.reply_text(
         "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot.\n\n"
-        "Please enter your Instagram handle without the @ symbol. "
-        "If you are a Tiktok user, you can fill in your Tiktok username. Instagram is preferred.",
+        "Please enter your Instagram handle without the @ symbol. If you are a Tiktok user, "
+        "you can fill in your Tiktok username. Instagram is preferred.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return IG_CAPTURE
@@ -811,9 +804,7 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     saved_birthday = get_saved_birthday(user.id)
     if not saved_birthday:
         await update.message.reply_text(
-            "Please enter your birthday in DD-MM-YYYY format.\n\n"
-            "Example:\n"
-            "14-09-1996"
+            "Please enter your birthday in DD-MM-YYYY format.\n\nExample:\n14-09-1996"
         )
         return BIRTHDAY_CAPTURE
 
@@ -847,13 +838,26 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return BIRTHDAY_CAPTURE
 
     user = update.effective_user
-    store.update_customer_fields(
-        user.id,
-        {
-            "birthday": birthday,
-            "last_activity_at": utc_now(),
-        },
-    )
+    existing = store.get_customer_by_telegram_id(user.id)
+
+    if existing:
+        store.update_customer_fields(
+            user.id,
+            {
+                "instagram_handle": str(existing.get("instagram_handle", "")).strip(),
+                "birthday": birthday,
+                "last_activity_at": utc_now(),
+            },
+        )
+    else:
+        store.upsert_customer(user.id, user.username or "", "")
+        store.update_customer_fields(
+            user.id,
+            {
+                "birthday": birthday,
+                "last_activity_at": utc_now(),
+            },
+        )
 
     next_action = context.user_data.pop("pending_action", None)
     instagram_handle = get_saved_instagram(user.id) or context.user_data.get("instagram_handle", "")
@@ -868,6 +872,8 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await run_checkpoints(update, context, instagram_handle)
     if next_action == "redeemrewards":
         return await run_redeem_entry(update, context, instagram_handle)
+    if next_action == "start_menu":
+        return await show_main_menu(update, context, "Thanks! Your birthday has been saved.\n\nPlease choose an option.")
 
     return await show_main_menu(
         update,
@@ -987,20 +993,8 @@ async def redeem_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code = make_code("RED")
     value = REWARD_OPTIONS[pts]
-    expires_at = (now_dt() + timedelta(days=30)).isoformat()
 
-    store.create_redemption(
-        code=code,
-        telegram_user_id=user.id,
-        telegram_username=user.username or "",
-        instagram_handle=instagram_handle,
-        reward_points=pts,
-        reward_value=value,
-        issued_at=utc_now(),
-        expires_at=expires_at,
-    )
-
-    new_balance = store.add_points(
+    store.add_points(
         telegram_user_id=user.id,
         instagram_handle=instagram_handle,
         points=-pts,
@@ -1010,7 +1004,7 @@ async def redeem_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await query.edit_message_text(
-        f"Voucher issued 🎉\n\nCode: {code}\nValue: {value}\nRemaining points: {new_balance}"
+        f"Voucher issued 🎉\n\nCode: {code}\nValue: {value}\nRemaining points: {store.recalculate_customer_balance(user.id)}"
     )
 
 
@@ -1172,19 +1166,17 @@ async def return_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ]]
     )
 
-    summary = (
-        "Packaging Return Request\n\n"
-        f"Request code: {code}\n"
-        f"Telegram user ID: {user.id}\n"
-        f"Instagram: @{instagram_handle}\n"
-        f"Preferred collection date/time: {preferred_dt}\n"
-        f"Embroidered pouches: {qty}\n"
-        f"Points requested: {qty}"
-    )
-
     await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
-        text=summary,
+        text=(
+            "Packaging Return Request\n\n"
+            f"Request code: {code}\n"
+            f"Telegram user ID: {user.id}\n"
+            f"Instagram: @{instagram_handle}\n"
+            f"Preferred collection date/time: {preferred_dt}\n"
+            f"Embroidered pouches: {qty}\n"
+            f"Points requested: {qty}"
+        ),
         reply_markup=keyboard,
     )
 
@@ -1268,8 +1260,8 @@ async def handle_packaging_admin_action(query, context, action: str, code: str) 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
     data = query.data
+
     if data.startswith("pr|"):
         try:
             _, action, code = data.split("|", 2)
