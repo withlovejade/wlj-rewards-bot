@@ -715,6 +715,13 @@ def get_saved_instagram(user_id: int) -> Optional[str]:
     return None
 
 
+def get_saved_birthday(user_id: int) -> Optional[str]:
+    customer = store.get_customer_by_telegram_id(user_id)
+    if customer and str(customer.get("birthday", "")).strip():
+        return str(customer.get("birthday", "")).strip()
+    return None
+
+
 async def ask_for_instagram(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -813,7 +820,7 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return BIRTHDAY_CAPTURE
 
-    next_action = context.user_data.get("pending_action")
+    next_action = context.user_data.pop("pending_action", None)
 
     if next_action == "returnpackaging":
         await update.message.reply_text(
@@ -861,7 +868,7 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         },
     )
 
-    next_action = context.user_data.get("pending_action")
+    next_action = context.user_data.pop("pending_action", None)
     instagram_handle = get_saved_instagram(user.id) or context.user_data.get("instagram_handle", "")
 
     if next_action == "returnpackaging":
@@ -896,10 +903,20 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # =========================
 
 async def checkpoints_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    instagram_handle = get_saved_instagram(update.effective_user.id)
+    user_id = update.effective_user.id
+
+    instagram_handle = get_saved_instagram(user_id)
+    birthday = get_saved_birthday(user_id)
 
     if not instagram_handle:
         return await ask_for_instagram(update, context, "checkpoints")
+
+    if not birthday:
+        context.user_data["pending_action"] = "checkpoints"
+        await update.message.reply_text(
+            "Please enter your birthday in DD-MM-YYYY format.\n\nExample:\n14-09-1996"
+        )
+        return BIRTHDAY_CAPTURE
 
     return await run_checkpoints(update, context, instagram_handle)
 
@@ -956,10 +973,20 @@ async def run_checkpoints(update: Update, context: ContextTypes.DEFAULT_TYPE, in
 # =========================
 
 async def redeemrewards_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    instagram_handle = get_saved_instagram(update.effective_user.id)
+    user_id = update.effective_user.id
+
+    instagram_handle = get_saved_instagram(user_id)
+    birthday = get_saved_birthday(user_id)
 
     if not instagram_handle:
         return await ask_for_instagram(update, context, "redeemrewards")
+
+    if not birthday:
+        context.user_data["pending_action"] = "redeemrewards"
+        await update.message.reply_text(
+            "Please enter your birthday in DD-MM-YYYY format."
+        )
+        return BIRTHDAY_CAPTURE
 
     return await run_redeem_entry(update, context, instagram_handle)
 
@@ -1066,15 +1093,31 @@ async def capture_changed_handle(update: Update, context: ContextTypes.DEFAULT_T
 
 async def howitworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (
-        "WLJ Rewards:\n\n"
-        "- Purchases earn points\n"
-        "- Points expire after 6 months\n"
-        "- Tier based on last 6 months\n"
-        "- Multipliers:\n"
-        "  Water: +50%\n"
-        "  Icy: +100%\n"
-        "  Glassy: +200%\n"
-        "- Packaging returns = 1 point per pouch"
+        "✨ WLJ Rewards – How It Works ✨\n\n"
+
+        "🛍️ Earning Points\n"
+        "- Every purchase earns points based on amount spent\n"
+        "- Points expire after 6 months\n\n"
+
+        "🏆 Membership Tiers (based on last 6 months)\n"
+        "Bean: 0+ points\n"
+        "Water: 1500+ points\n"
+        "Icy: 3000+ points\n"
+        "Glassy: 10000+ points\n\n"
+
+        "⚡ Tier Benefits (multipliers)\n"
+        "Bean: not applicable for multiplier\n"
+        "Water: 50% extra bonus points!\n"
+        "Icy: 100% extra bonus points\n"
+        "Glassy: 200% extra bonus points\n\n"
+
+        "♻️ Extra Points\n"
+        "- Return embroidered pouches → 1 point per pouch\n\n"
+
+        "🎁 Redeem Rewards\n"
+        "Use your points to redeem vouchers anytime!\n\n"
+
+        "Stay loyal, earn more, and climb the tiers 💖"
     )
 
     return await show_main_menu(update, context, text)
@@ -1100,21 +1143,27 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # =========================
 
 async def returnpackaging_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    instagram_handle = get_saved_instagram(update.effective_user.id)
+    user_id = update.effective_user.id
+
+    instagram_handle = get_saved_instagram(user_id)
+    birthday = get_saved_birthday(user_id)
 
     if not instagram_handle:
         return await ask_for_instagram(update, context, "returnpackaging")
 
+    if not birthday:
+        context.user_data["pending_action"] = "returnpackaging"
+        await update.message.reply_text(
+            "Please enter your birthday in DD-MM-YYYY format."
+        )
+        return BIRTHDAY_CAPTURE
+
     context.user_data["instagram_handle"] = instagram_handle
 
     await update.message.reply_text(
-        "Please enter your preferred collection date and time for the coming week.\n\n"
-        "Example:\n"
-        "Tuesday 7pm\n"
-        "or\n"
-        "18 Apr 2026, 2pm",
-        reply_markup=ReplyKeyboardRemove(),
+        "Please enter your preferred collection date and time.\n\nExample:\nTuesday 7pm"
     )
+
     return RETURN_PREFERRED_DATETIME
 
 
