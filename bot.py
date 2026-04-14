@@ -280,7 +280,7 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data["instagram_handle"] = instagram_handle
     await update.message.reply_text(
-        "Please enter your birthday in DDMMYYYY format. This is for us to surprise you on your birthday!\n\nExample:\n14-09-1996 it is necessary to include the dashes."
+        "Please enter your birthday in DDMMYYYY format. This is for us to surprise you on your birthday!\n\nExample:\n14/09/1996 it is necessary to include the slashes if not it can't be captured correctly."
     )
     return BIRTHDAY_CAPTURE
 
@@ -343,10 +343,11 @@ async def howitworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "✨ WLJ Rewards – How It Works ✨\n\n"
         "🏆 Membership Tiers\n"
         "Bean: 0+ points\n"
-        "Water: 1500+ points\n"
+        "Water: 1500+ points\n" 
         "Icy: 3000+ points\n"
         "Glassy: 10000+ points\n\n"
-        "⏳ Reward points will expire in 6 months, so please redeem them before expiry.\n\n"
+        "⏳ Reward points will expire in 6 months, so please redeem them before expiry.\n"
+        "For more details, click into the link https://t.me/c/3895840022/277/1142 to read more!\n\n"
         "🎁 Reward claims are handled by WLJ admin/backend."
     )
     return await show_main_menu(update, text)
