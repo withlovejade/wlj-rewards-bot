@@ -346,7 +346,7 @@ async def howitworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Water: 1500+ points\n"
         "Icy: 3000+ points\n"
         "Glassy: 10000+ points\n\n"
-        "⏳ Reward points may expire, so please redeem them before expiry.\n\n"
+        "⏳ Reward points will expire in 6 months, so please redeem them before expiry.\n\n"
         "🎁 Reward claims are handled by WLJ admin/backend."
     )
     return await show_main_menu(update, text)
