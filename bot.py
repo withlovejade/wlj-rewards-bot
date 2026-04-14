@@ -1,28 +1,20 @@
-
 import os
 import json
 import base64
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
 
@@ -34,14 +26,14 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"].strip()
-ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"].strip())
 
 b64 = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON_B64"].strip().replace("\n", "")
 b64 += "=" * (-len(b64) % 4)
 GOOGLE_SERVICE_ACCOUNT_JSON = base64.b64decode(b64).decode("utf-8")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-POINTS_SHEET = "2026 Purchases"
+LEDGER_SHEET = "Ledger"
+BIRTHDAY_SHEET = "Birthday"
 LOCAL_STATE_FILE = "local_user_state.json"
 
 MENU, IG_CAPTURE, BIRTHDAY_CAPTURE, CHANGE_HANDLE_CAPTURE = range(4)
@@ -50,10 +42,6 @@ MENU_KEYBOARD = [
     ["Check Points", "How It Works"],
     ["Change Handle", "Contact Admin"],
 ]
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def normalize_instagram(value: str) -> str:
@@ -73,11 +61,6 @@ def parse_birthday_ddmmyyyy(value: str) -> Optional[str]:
         return dt.strftime("%d%m%Y")
     except ValueError:
         return None
-
-
-def birthday_pretty_ddmmyy(value: str) -> str:
-    dt = datetime.strptime(value, "%d%m%Y")
-    return dt.strftime("%d%m%y")
 
 
 def date_serial_to_datetime(value) -> Optional[datetime]:
@@ -109,8 +92,9 @@ class LocalState:
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
 
-    def get_user(self, telegram_user_id: int) -> Dict[str, str]:
-        return self.data.get(normalize_user_id(telegram_user_id), {})
+    def get_instagram(self, telegram_user_id: int) -> Optional[str]:
+        row = self.data.get(normalize_user_id(telegram_user_id), {})
+        return row.get("instagram_handle")
 
     def set_instagram(self, telegram_user_id: int, instagram_handle: str) -> None:
         key = normalize_user_id(telegram_user_id)
@@ -118,20 +102,6 @@ class LocalState:
         row["instagram_handle"] = instagram_handle
         self.data[key] = row
         self._save()
-
-    def set_birthday(self, telegram_user_id: int, birthday_ddmmyyyy: str) -> None:
-        key = normalize_user_id(telegram_user_id)
-        row = self.data.get(key, {})
-        row["birthday"] = birthday_ddmmyyyy
-        row["birthday_request_sent_at"] = utc_now()
-        self.data[key] = row
-        self._save()
-
-    def get_instagram(self, telegram_user_id: int) -> Optional[str]:
-        return self.get_user(telegram_user_id).get("instagram_handle")
-
-    def get_birthday(self, telegram_user_id: int) -> Optional[str]:
-        return self.get_user(telegram_user_id).get("birthday")
 
 
 class SheetsStore:
@@ -141,13 +111,13 @@ class SheetsStore:
         self.service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
         self.spreadsheet_id = spreadsheet_id
 
-    def read_sheet(self, sheet_name: str) -> Tuple[List[str], List[Dict[str, str]]]:
+    def read_sheet(self, sheet_name: str, a1_range: str = "A:Z") -> Tuple[List[str], List[Dict[str, str]]]:
         result = (
             self.service.spreadsheets()
             .values()
             .get(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{sheet_name}!A:G",
+                range=f"{sheet_name}!{a1_range}",
                 valueRenderOption="UNFORMATTED_VALUE",
             )
             .execute()
@@ -165,13 +135,76 @@ class SheetsStore:
             rows.append(row_dict)
         return headers, rows
 
-    def find_rows_by_instagram(self, instagram_handle: str) -> List[Dict[str, str]]:
-        _, rows = self.read_sheet(POINTS_SHEET)
+    def append_row(self, sheet_name: str, values: List[str]) -> None:
+        body = {"values": [values]}
+        (
+            self.service.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{sheet_name}!A:Z",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body=body,
+            )
+            .execute()
+        )
+
+    def update_row_at_index(self, sheet_name: str, row_index: int, row_values: List[str]) -> None:
+        body = {"values": [row_values]}
+        (
+            self.service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{sheet_name}!A{row_index}:Z{row_index}",
+                valueInputOption="USER_ENTERED",
+                body=body,
+            )
+            .execute()
+        )
+
+    def find_ledger_rows_by_instagram(self, instagram_handle: str) -> List[Dict[str, str]]:
+        _, rows = self.read_sheet(LEDGER_SHEET, "A:G")
         target = normalize_instagram(instagram_handle)
         return [
             row for row in rows
             if normalize_instagram(row.get("instagram_handle", "")) == target
         ]
+
+    def upsert_birthday_row(self, instagram_handle: str, birthday_ddmmyyyy: str) -> None:
+        headers, rows = self.read_sheet(BIRTHDAY_SHEET, "A:D")
+        target = normalize_instagram(instagram_handle)
+
+        if not headers:
+            return
+
+        target_index = None
+        target_row = None
+        for row_index, row in enumerate(rows, start=2):
+            current = normalize_instagram(row.get("instagram_handle", ""))
+            if current == target:
+                target_index = row_index
+                target_row = row
+
+        if target_index is not None and target_row is not None:
+            updated = [target_row.get(h, "") for h in headers]
+            if "instagram_handle" in headers:
+                updated[headers.index("instagram_handle")] = instagram_handle
+            if "birthday" in headers:
+                updated[headers.index("birthday")] = birthday_ddmmyyyy
+            self.update_row_at_index(BIRTHDAY_SHEET, target_index, updated)
+            return
+
+        new_row = []
+        for h in headers:
+            if h == "instagram_handle":
+                new_row.append(instagram_handle)
+            elif h == "birthday":
+                new_row.append(birthday_ddmmyyyy)
+            else:
+                new_row.append("")
+        self.append_row(BIRTHDAY_SHEET, new_row)
 
 
 state = LocalState(LOCAL_STATE_FILE)
@@ -183,13 +216,14 @@ def main_menu_markup() -> ReplyKeyboardMarkup:
 
 
 def calculate_points_summary(instagram_handle: str) -> Dict[str, object]:
-    rows = store.find_rows_by_instagram(instagram_handle)
-
+    rows = store.find_ledger_rows_by_instagram(instagram_handle)
     total_usable = 0.0
     expiring_soon = 0.0
+    rows_found = 0
     now = datetime.now()
 
     for row in rows:
+        rows_found += 1
         redeem_status = str(row.get("redeem_status", "")).strip().lower()
         expired_flag = str(row.get("expired_flag", "")).strip().lower()
 
@@ -206,16 +240,13 @@ def calculate_points_summary(instagram_handle: str) -> Dict[str, object]:
         total_usable += usable_points
 
         expires_at = date_serial_to_datetime(row.get("expires_at", ""))
-        if expires_at is None:
-            continue
-
-        if now <= expires_at <= (now + timedelta(days=30)):
+        if expires_at and now <= expires_at <= (now + timedelta(days=30)):
             expiring_soon += usable_points
 
     return {
+        "rows_found": rows_found,
         "total_usable": round(total_usable, 2),
         "expiring_soon": round(expiring_soon, 2),
-        "rows_found": len(rows),
     }
 
 
@@ -225,78 +256,33 @@ async def show_main_menu(update: Update, text: str = "Please choose an option.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    saved_instagram = state.get_instagram(user.id)
-    saved_birthday = state.get_birthday(user.id)
+    saved_instagram = state.get_instagram(update.effective_user.id)
 
-    if saved_instagram and saved_birthday:
+    if saved_instagram:
         return await show_main_menu(
             update,
             f"Welcome back! Your saved Instagram handle is @{saved_instagram}.\n\nPlease choose an option.",
         )
 
-    if not saved_instagram:
-        await update.effective_message.reply_text(
-            "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot.\n\n"
-            "Please enter your Instagram handle without the @ symbol.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return IG_CAPTURE
-
     await update.effective_message.reply_text(
-        "Please enter your birthday in DDMMYYYY format.\n\nExample:\n14091996",
+        "Welcome to WLJ Family Rewards! I am your friendly WLJ Rewards Bot.\n\n"
+        "Please enter your Instagram handle without the @ symbol.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    return BIRTHDAY_CAPTURE
+    return IG_CAPTURE
 
 
 async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     instagram_handle = normalize_instagram(update.message.text)
-    user = update.effective_user
-
     if not instagram_handle:
         await update.message.reply_text("Please enter your Instagram handle without the @ symbol.")
         return IG_CAPTURE
 
-    state.set_instagram(user.id, instagram_handle)
-
-    saved_birthday = state.get_birthday(user.id)
-    if saved_birthday:
-        return await show_main_menu(
-            update,
-            f"Thanks! Your Instagram handle has been saved as @{instagram_handle}.\n\nPlease choose an option.",
-        )
-
+    context.user_data["instagram_handle"] = instagram_handle
     await update.message.reply_text(
         "Please enter your birthday in DDMMYYYY format.\n\nExample:\n14091996"
     )
     return BIRTHDAY_CAPTURE
-
-
-async def send_birthday_request_to_admin(
-    context: ContextTypes.DEFAULT_TYPE,
-    instagram_handle: str,
-    birthday_ddmmyyyy: str,
-) -> None:
-    code = f"bday|{instagram_handle}|{birthday_ddmmyyyy}"
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Approve", callback_data=f"{code}|approve"),
-            InlineKeyboardButton("Reject", callback_data=f"{code}|reject"),
-        ]
-    ])
-
-    message = (
-        f"Birthday voucher request: {instagram_handle}\n"
-        f"Birthday on {birthday_pretty_ddmmyy(birthday_ddmmyyyy)}\n"
-        "Expire in 1 month"
-    )
-
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=message,
-        reply_markup=keyboard,
-    )
 
 
 async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -307,8 +293,7 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return BIRTHDAY_CAPTURE
 
-    user = update.effective_user
-    instagram_handle = state.get_instagram(user.id)
+    instagram_handle = context.user_data.get("instagram_handle")
     if not instagram_handle:
         await update.message.reply_text(
             "Please enter your Instagram handle without the @ symbol.",
@@ -316,8 +301,8 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return IG_CAPTURE
 
-    state.set_birthday(user.id, birthday)
-    await send_birthday_request_to_admin(context, instagram_handle, birthday)
+    state.set_instagram(update.effective_user.id, instagram_handle)
+    store.upsert_birthday_row(instagram_handle, birthday)
 
     return await show_main_menu(
         update,
@@ -326,9 +311,7 @@ async def capture_birthday(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def checkpoints_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    instagram_handle = state.get_instagram(user.id)
-
+    instagram_handle = state.get_instagram(update.effective_user.id)
     if not instagram_handle:
         await update.effective_message.reply_text(
             "Please enter your Instagram handle without the @ symbol.",
@@ -388,10 +371,7 @@ async def capture_changed_handle(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def contactadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await show_main_menu(
-        update,
-        "Please contact WLJ admin through your usual WLJ contact channel."
-    )
+    return await show_main_menu(update, "Please contact WLJ admin through your usual WLJ contact channel.")
 
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -407,30 +387,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return await contactadmin(update, context)
 
     return await show_main_menu(update, "Please choose one of the menu options.")
-
-
-async def birthday_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("|")
-    if len(parts) != 4 or parts[0] != "bday":
-        await query.edit_message_text("Invalid birthday action.")
-        return
-
-    _, instagram_handle, birthday_ddmmyyyy, action = parts
-
-    if action == "approve":
-        await query.edit_message_text(
-            f"Approved birthday voucher for {instagram_handle} (Birthday on {birthday_pretty_ddmmyy(birthday_ddmmyyyy)})."
-        )
-        return
-
-    if action == "reject":
-        await query.edit_message_text(
-            f"Rejected birthday voucher for {instagram_handle} (Birthday on {birthday_pretty_ddmmyy(birthday_ddmmyyyy)})."
-        )
-        return
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -453,9 +409,7 @@ def main() -> None:
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(birthday_admin_callback, pattern=r"^bday\|"))
-
-    logger.info("WLJ ultra-simple bot is running...")
+    logger.info("WLJ two-tab bot is running...")
     app.run_polling()
 
 
