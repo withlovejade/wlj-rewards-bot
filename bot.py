@@ -233,7 +233,7 @@ def calculate_points_summary(instagram_handle: str) -> Dict[str, object]:
             continue
 
         try:
-            usable_points = float(row.get("usable_points", 0) or 0)
+            row.get("multiplier_bonus")
         except Exception:
             usable_points = 0.0
 
