@@ -280,7 +280,7 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data["instagram_handle"] = instagram_handle
     await update.message.reply_text(
-        "Please enter your birthday in DDMMYYYY format.\n\nExample:\n14091996"
+        "Please enter your birthday in DDMMYYYY format. This is for us to surprise you on your birthday!\n\nExample:\n14091996"
     )
     return BIRTHDAY_CAPTURE
 
@@ -333,7 +333,7 @@ async def checkpoints_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     else:
         lines.append("No points are expiring within 30 days.")
 
-    lines.append("Reward points may expire, so please redeem them before expiry.")
+    lines.append("Reward points will expire in 6 months from date of purchase, so please redeem them before expiry.")
 
     return await show_main_menu(update, "\n".join(lines))
 
