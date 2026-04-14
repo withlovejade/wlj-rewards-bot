@@ -280,7 +280,7 @@ async def capture_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data["instagram_handle"] = instagram_handle
     await update.message.reply_text(
-        "Please enter your birthday in DDMMYYYY format. This is for us to surprise you on your birthday!\n\nExample:\n14091996"
+        "Please enter your birthday in DDMMYYYY format. This is for us to surprise you on your birthday!\n\nExample:\n14-09-1996 it is necessary to include the dashes."
     )
     return BIRTHDAY_CAPTURE
 
